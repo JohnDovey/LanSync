@@ -6,16 +6,20 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"net"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
+	"github.com/mattn/go-isatty"
 	_ "modernc.org/sqlite"
 )
 
@@ -719,10 +723,16 @@ func main() {
 
 	fmt.Printf("LanSync server listening on port %d\n", config.Port)
 
+	// Accept loop exits cleanly when the listener is closed on shutdown.
+	// Without this check, Close() surfaces as a noisy "use of closed network
+	// connection" and the goroutine would spin forever.
 	go func() {
 		for {
 			conn, err := listener.Accept()
 			if err != nil {
+				if errors.Is(err, net.ErrClosed) || isClosedNetworkError(err) {
+					return
+				}
 				fmt.Printf("Connection error: %v\n", err)
 				continue
 			}
@@ -730,13 +740,51 @@ func main() {
 		}
 	}()
 
+	// ServiceMonitor (and other supervisors) start us with no console / null
+	// stdin. The old TUI treated stdin EOF as "quit", which closed the
+	// listener immediately and produced: accept tcp [::]:10101: use of
+	// closed network connection. Headless mode blocks on OS signals instead.
+	if !isatty.IsTerminal(os.Stdin.Fd()) && !isatty.IsCygwinTerminal(os.Stdin.Fd()) {
+		runHeadless(listener)
+		return
+	}
+
+	runInteractive(server, listener)
+}
+
+// isClosedNetworkError matches the pre-Go-1.16 string and Windows variants
+// of a closed listener Accept error.
+func isClosedNetworkError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "use of closed network connection") ||
+		strings.Contains(msg, "closed network connection")
+}
+
+// runHeadless keeps the server alive until SIGINT/SIGTERM (or Windows
+// process termination from ServiceMonitor).
+func runHeadless(listener net.Listener) {
+	fmt.Println("Running headless (no interactive console). Waiting for signal to stop...")
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	sig := <-sigCh
+	fmt.Printf("Shutting down (%v)...\n", sig)
+	_ = listener.Close()
+}
+
+func runInteractive(server *Server, listener net.Listener) {
 	scanner := bufio.NewScanner(os.Stdin)
 	for {
 		server.displayStatus()
 		fmt.Print("sync> ")
 
 		if !scanner.Scan() {
-			break
+			// Real console closed (e.g. window closed); shut down cleanly.
+			fmt.Println("\nStdin closed; shutting down...")
+			_ = listener.Close()
+			return
 		}
 
 		switch strings.TrimSpace(scanner.Text()) {
@@ -760,6 +808,7 @@ func main() {
 
 		case "q":
 			fmt.Println("Shutting down...")
+			_ = listener.Close()
 			return
 
 		case "":
