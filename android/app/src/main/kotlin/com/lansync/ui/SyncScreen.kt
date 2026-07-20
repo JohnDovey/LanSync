@@ -139,45 +139,68 @@ class SyncViewModel(private val context: Context) : ViewModel() {
             _uploadProgress.value = emptyMap()
             clearDeleteState()
 
+            val manager = uploadManager ?: run {
+                _uiState.value = UiState.Error("Not connected to server")
+                return@launch
+            }
+
             try {
-                val prepared = selectedItems.map { item ->
-                    val fileData = context.contentResolver.openInputStream(item.uri)?.use { it.readBytes() }
-                        ?: throw Exception("Cannot read file: ${item.displayLabel()}")
-                    val fileInfo = buildFileInfo(item, fileData)
-                    PreparedUpload(item.uri, fileInfo, fileData)
-                }
+                // Process large folders in batches so we never hold every file's
+                // bytes in RAM at once, and never stop at an arbitrary 1000-file cap.
+                manager.beginSession()
+                val completedUris = mutableListOf<Uri>()
+                val batches = selectedItems.chunked(UPLOAD_BATCH_SIZE)
+                var batchIndex = 0
 
-                val result = uploadManager?.uploadFiles(
-                    prepared.map { it.fileInfo to it.fileData }
-                ) { fileInfo ->
-                    handleConflict(fileInfo)
-                }
-
-                if (result?.isFailure == true) {
-                    _uiState.value = UiState.Error(
-                        result.exceptionOrNull()?.message ?: "Sync failed"
+                for (batch in batches) {
+                    batchIndex++
+                    Log.i(
+                        TAG,
+                        "Uploading batch $batchIndex/${batches.size} " +
+                            "(${batch.size} files, ${selectedItems.size} total)"
                     )
-                } else {
-                    val progress = uploadManager?.getProgress().orEmpty()
-                    val completedUris = prepared.mapNotNull { item ->
-                        val key = "${item.fileInfo.filename}|${item.fileInfo.fileHash}"
-                        if (progress[key]?.status == UploadStatus.COMPLETED) item.uri else null
+
+                    val prepared = batch.map { item ->
+                        val fileData = withContext(Dispatchers.IO) {
+                            context.contentResolver.openInputStream(item.uri)?.use { it.readBytes() }
+                        } ?: throw Exception("Cannot read file: ${item.displayLabel()}")
+                        val fileInfo = buildFileInfo(item, fileData)
+                        item.uri to (fileInfo to fileData)
                     }
-                    _deletableUris.value = completedUris
-                    _showDeletePrompt.value = completedUris.isNotEmpty()
-                    _uiState.value = UiState.Complete
+
+                    val result = manager.uploadFiles(
+                        files = prepared.map { it.second },
+                        onConflict = { fileInfo -> handleConflict(fileInfo) },
+                        clearExisting = false
+                    )
+
+                    if (result.isFailure) {
+                        _uiState.value = UiState.Error(
+                            result.exceptionOrNull()?.message
+                                ?: "Sync failed on batch $batchIndex/${batches.size}"
+                        )
+                        return@launch
+                    }
+
+                    val progress = manager.getProgress()
+                    for ((uri, pair) in prepared) {
+                        val fileInfo = pair.first
+                        val key = "${fileInfo.filename}|${fileInfo.fileHash}"
+                        if (progress[key]?.status == UploadStatus.COMPLETED) {
+                            completedUris.add(uri)
+                        }
+                    }
+                    // prepared goes out of scope here → batch byte arrays can be GC'd
                 }
+
+                _deletableUris.value = completedUris.distinct()
+                _showDeletePrompt.value = completedUris.isNotEmpty()
+                _uiState.value = UiState.Complete
             } catch (e: Exception) {
                 _uiState.value = UiState.Error(e.message ?: "Sync failed")
             }
         }
     }
-
-    private data class PreparedUpload(
-        val uri: Uri,
-        val fileInfo: FileInfo,
-        val fileData: ByteArray
-    )
 
     private suspend fun handleConflict(fileInfo: FileInfo): ConflictResolution? {
         pendingConflictFile = fileInfo
@@ -464,12 +487,12 @@ class SyncViewModel(private val context: Context) : ViewModel() {
     }
 
     /**
-     * Recursively list files under a tree URI from [OpenDocumentTree].
+     * Recursively list **all** files under a tree URI from [OpenDocumentTree].
+     * No hard cap — large folders are fully enumerated; uploads are batched later.
      * Each entry includes a relative path starting with the selected folder name
-     * so the server can recreate the same tree
      * (e.g. `Camera/Vacation/IMG_001.jpg`).
      */
-    suspend fun listFilesInTree(treeUri: Uri, maxFiles: Int = MAX_FOLDER_FILES): List<SelectedItem> =
+    suspend fun listFilesInTree(treeUri: Uri): List<SelectedItem> =
         withContext(Dispatchers.IO) {
             val result = ArrayList<SelectedItem>()
             try {
@@ -479,9 +502,9 @@ class SyncViewModel(private val context: Context) : ViewModel() {
                     treeUri = treeUri,
                     documentId = rootId,
                     relativeDir = rootName,
-                    out = result,
-                    maxFiles = maxFiles
+                    out = result
                 )
+                Log.i(TAG, "Listed ${result.size} file(s) under folder tree")
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to list folder $treeUri", e)
             }
@@ -506,10 +529,8 @@ class SyncViewModel(private val context: Context) : ViewModel() {
         treeUri: Uri,
         documentId: String,
         relativeDir: String,
-        out: MutableList<SelectedItem>,
-        maxFiles: Int
+        out: MutableList<SelectedItem>
     ) {
-        if (out.size >= maxFiles) return
         val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, documentId)
         val projection = arrayOf(
             DocumentsContract.Document.COLUMN_DOCUMENT_ID,
@@ -522,7 +543,7 @@ class SyncViewModel(private val context: Context) : ViewModel() {
                 val mimeIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_MIME_TYPE)
                 val nameIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
                 if (idIdx < 0 || mimeIdx < 0) return
-                while (cursor.moveToNext() && out.size < maxFiles) {
+                while (cursor.moveToNext()) {
                     val childId = cursor.getString(idIdx) ?: continue
                     val mime = cursor.getString(mimeIdx).orEmpty()
                     val childName = if (nameIdx >= 0) {
@@ -534,7 +555,7 @@ class SyncViewModel(private val context: Context) : ViewModel() {
                     if (mime == DocumentsContract.Document.MIME_TYPE_DIR) {
                         val subDirName = SyncClient.sanitizeFilename(childName)
                         val nextDir = if (relativeDir.isBlank()) subDirName else "$relativeDir/$subDirName"
-                        walkDocumentTree(treeUri, childId, nextDir, out, maxFiles)
+                        walkDocumentTree(treeUri, childId, nextDir, out)
                     } else {
                         val fileName = SyncClient.sanitizeFilename(childName)
                         val relativePath = if (relativeDir.isBlank()) fileName else "$relativeDir/$fileName"
@@ -585,7 +606,8 @@ class SyncViewModel(private val context: Context) : ViewModel() {
 
     companion object {
         private const val TAG = "SyncViewModel"
-        const val MAX_FOLDER_FILES = 1000
+        /** How many files to read into memory and upload before freeing the batch. */
+        const val UPLOAD_BATCH_SIZE = 50
     }
 }
 
@@ -817,8 +839,11 @@ fun FilePickerScreen(viewModel: SyncViewModel) {
             } else {
                 addItems(files)
                 val rootHint = files.first().relativePath?.substringBefore('/') ?: "folder"
-                statusMessage = if (files.size >= SyncViewModel.MAX_FOLDER_FILES) {
-                    "Added first ${files.size} files from “$rootHint” (limit reached) — structure preserved"
+                val batches = (files.size + SyncViewModel.UPLOAD_BATCH_SIZE - 1) /
+                    SyncViewModel.UPLOAD_BATCH_SIZE
+                statusMessage = if (files.size > SyncViewModel.UPLOAD_BATCH_SIZE) {
+                    "Added ${files.size} file(s) from “$rootHint” " +
+                        "(will upload in $batches batches of up to ${SyncViewModel.UPLOAD_BATCH_SIZE})"
                 } else {
                     "Added ${files.size} file(s) from “$rootHint” — folder structure will be recreated on server"
                 }

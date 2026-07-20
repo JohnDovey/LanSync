@@ -28,7 +28,8 @@ data class ConflictResolution(
 
 /**
  * Uploads files over a single [SyncClient] connection, one at a time.
- * After a connection error the client is reconnected so later files can still sync.
+ * Supports multi-batch runs so large folders can be processed without
+ * holding every file in memory at once.
  */
 class UploadManager(
     private val syncClient: SyncClient,
@@ -45,12 +46,45 @@ class UploadManager(
         onProgressUpdate = callback
     }
 
-    suspend fun uploadFiles(
-        files: List<Pair<FileInfo, ByteArray>>,
-        onConflict: suspend (FileInfo) -> ConflictResolution?
-    ): Result<UploadSummary> = withContext(Dispatchers.IO) {
+    /** Start a multi-batch sync (clears prior progress and conflict choices). */
+    fun beginSession() {
         globalConflictResolution = null
         uploadProgress.clear()
+        notifyProgress()
+    }
+
+    /**
+     * Seed PENDING rows for known files before their bytes are loaded
+     * (so the UI can show total count early).
+     */
+    fun seedPending(files: List<FileInfo>) {
+        for (fileInfo in files) {
+            val key = progressKey(fileInfo)
+            if (!uploadProgress.containsKey(key)) {
+                uploadProgress[key] = UploadProgress(
+                    fileInfo = fileInfo,
+                    currentBytes = 0,
+                    totalBytes = fileInfo.fileSize.coerceAtLeast(0),
+                    percentage = 0,
+                    status = UploadStatus.PENDING
+                )
+            }
+        }
+        notifyProgress()
+    }
+
+    /**
+     * Upload one batch of files. Does **not** clear existing progress so
+     * callers can chunk large folders (e.g. 100 files at a time).
+     */
+    suspend fun uploadFiles(
+        files: List<Pair<FileInfo, ByteArray>>,
+        onConflict: suspend (FileInfo) -> ConflictResolution?,
+        clearExisting: Boolean = true
+    ): Result<UploadSummary> = withContext(Dispatchers.IO) {
+        if (clearExisting) {
+            beginSession()
+        }
 
         files.forEach { (fileInfo, fileData) ->
             val key = progressKey(fileInfo)
