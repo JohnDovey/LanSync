@@ -48,7 +48,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
-import java.security.MessageDigest
+
 
 // ============================================================================
 // VIEW MODEL
@@ -145,57 +145,57 @@ class SyncViewModel(private val context: Context) : ViewModel() {
             }
 
             try {
-                // Process large folders in batches so we never hold every file's
-                // bytes in RAM at once, and never stop at an arbitrary 1000-file cap.
+                // One file at a time, fully streamed — DCIM / SD-card videos must
+                // never be loaded entirely into a ByteArray (that OOMs the app).
                 manager.beginSession()
                 val completedUris = mutableListOf<Uri>()
-                val batches = selectedItems.chunked(UPLOAD_BATCH_SIZE)
-                var batchIndex = 0
+                val total = selectedItems.size
 
-                for (batch in batches) {
-                    batchIndex++
-                    Log.i(
-                        TAG,
-                        "Uploading batch $batchIndex/${batches.size} " +
-                            "(${batch.size} files, ${selectedItems.size} total)"
-                    )
-
-                    val prepared = batch.map { item ->
-                        val fileData = withContext(Dispatchers.IO) {
-                            context.contentResolver.openInputStream(item.uri)?.use { it.readBytes() }
-                        } ?: throw Exception("Cannot read file: ${item.displayLabel()}")
-                        val fileInfo = buildFileInfo(item, fileData)
-                        item.uri to (fileInfo to fileData)
-                    }
-
-                    val result = manager.uploadFiles(
-                        files = prepared.map { it.second },
-                        onConflict = { fileInfo -> handleConflict(fileInfo) },
-                        clearExisting = false
-                    )
-
-                    if (result.isFailure) {
-                        _uiState.value = UiState.Error(
-                            result.exceptionOrNull()?.message
-                                ?: "Sync failed on batch $batchIndex/${batches.size}"
+                for ((index, item) in selectedItems.withIndex()) {
+                    Log.i(TAG, "Syncing ${index + 1}/$total: ${item.displayLabel()}")
+                    try {
+                        val fileInfo = withContext(Dispatchers.IO) {
+                            buildFileInfoStreaming(item)
+                        }
+                        manager.uploadFileStreaming(
+                            fileInfo = fileInfo,
+                            openStream = {
+                                context.contentResolver.openInputStream(item.uri)
+                            },
+                            onConflict = { handleConflict(it) }
                         )
-                        return@launch
-                    }
-
-                    val progress = manager.getProgress()
-                    for ((uri, pair) in prepared) {
-                        val fileInfo = pair.first
                         val key = "${fileInfo.filename}|${fileInfo.fileHash}"
-                        if (progress[key]?.status == UploadStatus.COMPLETED) {
-                            completedUris.add(uri)
+                        if (manager.getProgress()[key]?.status == UploadStatus.COMPLETED) {
+                            completedUris.add(item.uri)
+                        }
+                    } catch (oom: OutOfMemoryError) {
+                        Log.e(TAG, "OOM on ${item.displayLabel()}", oom)
+                        System.gc()
+                        runCatching {
+                            manager.markFailed(
+                                buildFileInfoStub(item, "Out of memory"),
+                                "Out of memory"
+                            )
+                        }
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Failed ${item.displayLabel()}", e)
+                        runCatching {
+                            manager.markFailed(
+                                buildFileInfoStub(item, e.message ?: "Failed"),
+                                e.message
+                            )
                         }
                     }
-                    // prepared goes out of scope here → batch byte arrays can be GC'd
                 }
 
                 _deletableUris.value = completedUris.distinct()
                 _showDeletePrompt.value = completedUris.isNotEmpty()
                 _uiState.value = UiState.Complete
+            } catch (oom: OutOfMemoryError) {
+                System.gc()
+                _uiState.value = UiState.Error(
+                    "Out of memory while syncing. Try a smaller folder, or sync photos without large videos."
+                )
             } catch (e: Exception) {
                 _uiState.value = UiState.Error(e.message ?: "Sync failed")
             }
@@ -241,21 +241,43 @@ class SyncViewModel(private val context: Context) : ViewModel() {
         return uri.lastPathSegment?.substringAfterLast('/') ?: "file"
     }
 
-    private fun buildFileInfo(item: SelectedItem, fileData: ByteArray): FileInfo {
+    private fun contentLength(uri: Uri): Long {
+        context.contentResolver.query(uri, arrayOf(OpenableColumns.SIZE), null, null, null)
+            ?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val idx = cursor.getColumnIndex(OpenableColumns.SIZE)
+                    if (idx >= 0 && !cursor.isNull(idx)) {
+                        val size = cursor.getLong(idx)
+                        if (size >= 0) return size
+                    }
+                }
+            }
+        return -1L
+    }
+
+    /**
+     * Hash + size via streaming (never [InputStream.readBytes]).
+     * Opens the content URI twice: once to hash, once later to upload.
+     */
+    private fun buildFileInfoStreaming(item: SelectedItem): FileInfo {
         val mimeType = context.contentResolver.getType(item.uri).orEmpty()
+        val (hash, length) = context.contentResolver.openInputStream(item.uri)?.use { stream ->
+            SyncClient.sha256AndLength(stream)
+        } ?: throw Exception("Cannot read file: ${item.displayLabel()}")
+
+        // Prefer streamed length; fall back to provider-reported size if stream was empty weirdly.
+        val size = if (length > 0) length else contentLength(item.uri).coerceAtLeast(0L)
         val relative = item.relativePath?.let { SyncClient.sanitizeRelativePath(it) }.orEmpty()
 
         return if (relative.isNotEmpty()) {
-            // Folder sync: preserve tree. Filename is the full relative path so
-            // the DB unique key and server storage recreate nested folders.
             val dir = relative.substringBeforeLast('/', missingDelimiterValue = "")
             FileInfo(
                 filename = relative,
-                fileHash = calculateHash(fileData),
+                fileHash = hash,
                 fileType = "folders",
                 directory = dir,
                 filePath = item.uri.toString(),
-                fileSize = fileData.size.toLong(),
+                fileSize = size,
                 mimeType = mimeType
             )
         } else {
@@ -266,21 +288,28 @@ class SyncViewModel(private val context: Context) : ViewModel() {
             }
             FileInfo(
                 filename = filename,
-                fileHash = calculateHash(fileData),
+                fileHash = hash,
                 fileType = fileType,
                 directory = fileType,
                 filePath = item.uri.toString(),
-                fileSize = fileData.size.toLong(),
+                fileSize = size,
                 mimeType = mimeType
             )
         }
     }
 
-    private fun calculateHash(data: ByteArray): String {
-        val digest = MessageDigest.getInstance("SHA-256")
-        return digest.digest(data).fold("") { str, it ->
-            str + "%02x".format(it)
-        }
+    private fun buildFileInfoStub(item: SelectedItem, error: String): FileInfo {
+        val relative = item.relativePath?.let { SyncClient.sanitizeRelativePath(it) }.orEmpty()
+        val name = relative.ifEmpty { SyncClient.sanitizeFilename(displayName(item.uri)) }
+        return FileInfo(
+            filename = name,
+            fileHash = "error",
+            fileType = if (relative.isNotEmpty()) "folders" else "documents",
+            directory = relative.substringBeforeLast('/', missingDelimiterValue = "documents"),
+            filePath = item.uri.toString(),
+            fileSize = 0,
+            mimeType = error
+        )
     }
 
     fun loadSyncHistory() {
@@ -487,10 +516,10 @@ class SyncViewModel(private val context: Context) : ViewModel() {
     }
 
     /**
-     * Recursively list **all** files under a tree URI from [OpenDocumentTree].
-     * No hard cap — large folders are fully enumerated; uploads are batched later.
-     * Each entry includes a relative path starting with the selected folder name
-     * (e.g. `Camera/Vacation/IMG_001.jpg`).
+     * List **all** files under a tree URI from [OpenDocumentTree] using an
+     * iterative BFS (no deep recursion → no stack overflow on nested trees).
+     * Relative paths start with the selected folder name
+     * (e.g. `DCIM/Camera/IMG_001.jpg`).
      */
     suspend fun listFilesInTree(treeUri: Uri): List<SelectedItem> =
         withContext(Dispatchers.IO) {
@@ -498,15 +527,79 @@ class SyncViewModel(private val context: Context) : ViewModel() {
             try {
                 val rootId = DocumentsContract.getTreeDocumentId(treeUri)
                 val rootName = treeRootDisplayName(treeUri, rootId)
-                walkDocumentTree(
-                    treeUri = treeUri,
-                    documentId = rootId,
-                    relativeDir = rootName,
-                    out = result
+                // BFS: (documentId, relativeDirPath)
+                val queue = ArrayDeque<Pair<String, String>>()
+                queue.add(rootId to rootName)
+
+                val projection = arrayOf(
+                    DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                    DocumentsContract.Document.COLUMN_MIME_TYPE,
+                    DocumentsContract.Document.COLUMN_DISPLAY_NAME
                 )
+
+                while (queue.isNotEmpty()) {
+                    val (documentId, relativeDir) = queue.removeFirst()
+                    val childrenUri =
+                        DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, documentId)
+                    try {
+                        context.contentResolver.query(
+                            childrenUri,
+                            projection,
+                            null,
+                            null,
+                            null
+                        )?.use { cursor ->
+                            val idIdx =
+                                cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+                            val mimeIdx =
+                                cursor.getColumnIndex(DocumentsContract.Document.COLUMN_MIME_TYPE)
+                            val nameIdx =
+                                cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+                            if (idIdx < 0 || mimeIdx < 0) return@use
+                            while (cursor.moveToNext()) {
+                                val childId = cursor.getString(idIdx) ?: continue
+                                val mime = cursor.getString(mimeIdx).orEmpty()
+                                val childName = if (nameIdx >= 0) {
+                                    cursor.getString(nameIdx)?.takeIf { it.isNotBlank() }
+                                } else {
+                                    null
+                                } ?: childId.substringAfterLast(':').substringAfterLast('/')
+
+                                if (mime == DocumentsContract.Document.MIME_TYPE_DIR) {
+                                    val subDirName = SyncClient.sanitizeFilename(childName)
+                                    val nextDir =
+                                        if (relativeDir.isBlank()) subDirName
+                                        else "$relativeDir/$subDirName"
+                                    queue.add(childId to nextDir)
+                                } else {
+                                    val fileName = SyncClient.sanitizeFilename(childName)
+                                    val relativePath =
+                                        if (relativeDir.isBlank()) fileName
+                                        else "$relativeDir/$fileName"
+                                    result.add(
+                                        SelectedItem(
+                                            uri = DocumentsContract.buildDocumentUriUsingTree(
+                                                treeUri,
+                                                childId
+                                            ),
+                                            relativePath = relativePath
+                                        )
+                                    )
+                                }
+                            }
+                        }
+                    } catch (e: SecurityException) {
+                        Log.w(TAG, "No access under $documentId", e)
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Error listing $documentId", e)
+                    }
+                }
                 Log.i(TAG, "Listed ${result.size} file(s) under folder tree")
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to list folder $treeUri", e)
+            } catch (oom: OutOfMemoryError) {
+                Log.e(TAG, "OOM listing folder (partial ${result.size} files)", oom)
+                System.gc()
             }
             result
         }
@@ -523,56 +616,6 @@ class SyncViewModel(private val context: Context) : ViewModel() {
             .substringAfterLast('/')
             .ifBlank { "folder" }
         return SyncClient.sanitizeFilename(fromId)
-    }
-
-    private fun walkDocumentTree(
-        treeUri: Uri,
-        documentId: String,
-        relativeDir: String,
-        out: MutableList<SelectedItem>
-    ) {
-        val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, documentId)
-        val projection = arrayOf(
-            DocumentsContract.Document.COLUMN_DOCUMENT_ID,
-            DocumentsContract.Document.COLUMN_MIME_TYPE,
-            DocumentsContract.Document.COLUMN_DISPLAY_NAME
-        )
-        try {
-            context.contentResolver.query(childrenUri, projection, null, null, null)?.use { cursor ->
-                val idIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
-                val mimeIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_MIME_TYPE)
-                val nameIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
-                if (idIdx < 0 || mimeIdx < 0) return
-                while (cursor.moveToNext()) {
-                    val childId = cursor.getString(idIdx) ?: continue
-                    val mime = cursor.getString(mimeIdx).orEmpty()
-                    val childName = if (nameIdx >= 0) {
-                        cursor.getString(nameIdx)?.takeIf { it.isNotBlank() }
-                    } else {
-                        null
-                    } ?: childId.substringAfterLast(':').substringAfterLast('/')
-
-                    if (mime == DocumentsContract.Document.MIME_TYPE_DIR) {
-                        val subDirName = SyncClient.sanitizeFilename(childName)
-                        val nextDir = if (relativeDir.isBlank()) subDirName else "$relativeDir/$subDirName"
-                        walkDocumentTree(treeUri, childId, nextDir, out)
-                    } else {
-                        val fileName = SyncClient.sanitizeFilename(childName)
-                        val relativePath = if (relativeDir.isBlank()) fileName else "$relativeDir/$fileName"
-                        out.add(
-                            SelectedItem(
-                                uri = DocumentsContract.buildDocumentUriUsingTree(treeUri, childId),
-                                relativePath = relativePath
-                            )
-                        )
-                    }
-                }
-            }
-        } catch (e: SecurityException) {
-            Log.w(TAG, "No access to document children under $documentId", e)
-        } catch (e: Exception) {
-            Log.w(TAG, "Error listing children under $documentId", e)
-        }
     }
 
     /** Return to file picker after a successful sync (keep connection). */
@@ -606,8 +649,8 @@ class SyncViewModel(private val context: Context) : ViewModel() {
 
     companion object {
         private const val TAG = "SyncViewModel"
-        /** How many files to read into memory and upload before freeing the batch. */
-        const val UPLOAD_BATCH_SIZE = 50
+        /** Max rows shown in the selected-file list (full count still syncs). */
+        const val UI_LIST_CAP = 100
     }
 }
 
@@ -833,20 +876,22 @@ fun FilePickerScreen(viewModel: SyncViewModel) {
         scope.launch {
             isScanningFolder = true
             statusMessage = "Scanning folder…"
-            val files = viewModel.listFilesInTree(treeUri)
-            if (files.isEmpty()) {
-                statusMessage = "No files found in that folder"
-            } else {
-                addItems(files)
-                val rootHint = files.first().relativePath?.substringBefore('/') ?: "folder"
-                val batches = (files.size + SyncViewModel.UPLOAD_BATCH_SIZE - 1) /
-                    SyncViewModel.UPLOAD_BATCH_SIZE
-                statusMessage = if (files.size > SyncViewModel.UPLOAD_BATCH_SIZE) {
-                    "Added ${files.size} file(s) from “$rootHint” " +
-                        "(will upload in $batches batches of up to ${SyncViewModel.UPLOAD_BATCH_SIZE})"
+            try {
+                val files = viewModel.listFilesInTree(treeUri)
+                if (files.isEmpty()) {
+                    statusMessage = "No files found in that folder"
                 } else {
-                    "Added ${files.size} file(s) from “$rootHint” — folder structure will be recreated on server"
+                    addItems(files)
+                    val rootHint = files.first().relativePath?.substringBefore('/') ?: "folder"
+                    statusMessage =
+                        "Added ${files.size} file(s) from “$rootHint”. " +
+                            "Large media is streamed (safe for DCIM / SD card)."
                 }
+            } catch (e: Exception) {
+                statusMessage = "Folder scan failed: ${e.message}"
+            } catch (oom: OutOfMemoryError) {
+                System.gc()
+                statusMessage = "Not enough memory to list that folder. Try a smaller subfolder."
             }
             isScanningFolder = false
         }
@@ -1006,6 +1051,20 @@ fun FilePickerScreen(viewModel: SyncViewModel) {
                 modifier = Modifier.padding(vertical = 8.dp)
             )
         } else if (selectedItems.isNotEmpty()) {
+            val visible = if (selectedItems.size > SyncViewModel.UI_LIST_CAP) {
+                selectedItems.take(SyncViewModel.UI_LIST_CAP)
+            } else {
+                selectedItems
+            }
+            if (selectedItems.size > SyncViewModel.UI_LIST_CAP) {
+                Text(
+                    "Showing first ${SyncViewModel.UI_LIST_CAP} of ${selectedItems.size} files " +
+                        "(all will still sync)",
+                    color = Color.Gray,
+                    fontSize = 12.sp,
+                    modifier = Modifier.padding(bottom = 4.dp)
+                )
+            }
             LazyColumn(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -1013,7 +1072,7 @@ fun FilePickerScreen(viewModel: SyncViewModel) {
                 contentPadding = PaddingValues(bottom = 16.dp)
             ) {
                 items(
-                    selectedItems,
+                    visible,
                     key = { "${it.uri}|${it.relativePath.orEmpty()}" }
                 ) { item ->
                     FileItemCard(
@@ -1095,6 +1154,18 @@ fun SyncProgressScreen(progress: Map<String, UploadProgress>) {
             it.status == UploadStatus.FAILED ||
             it.status == UploadStatus.SKIPPED
     }
+    val completed = items.count { it.status == UploadStatus.COMPLETED }
+    val failed = items.count { it.status == UploadStatus.FAILED }
+    val skipped = items.count { it.status == UploadStatus.SKIPPED }
+    // Only render a window of cards — huge DCIM runs would freeze Compose.
+    val active = items.filter { it.status == UploadStatus.UPLOADING || it.status == UploadStatus.PENDING }
+        .take(20)
+    val recentDone = items.filter {
+        it.status == UploadStatus.COMPLETED ||
+            it.status == UploadStatus.FAILED ||
+            it.status == UploadStatus.SKIPPED
+    }.takeLast(15)
+    val visible = (active + recentDone).distinctBy { "${it.fileInfo.filename}|${it.fileInfo.fileHash}" }
 
     Column(
         modifier = Modifier
@@ -1108,13 +1179,17 @@ fun SyncProgressScreen(progress: Map<String, UploadProgress>) {
             modifier = Modifier.padding(vertical = 16.dp)
         )
         Text(
-            if (items.isEmpty()) "Preparing..." else "Progress: $done / ${items.size}",
+            if (items.isEmpty()) {
+                "Preparing..."
+            } else {
+                "Progress: $done / ${items.size}  ·  ✓ $completed  ✗ $failed  ⊘ $skipped"
+            },
             color = Color.Gray,
             modifier = Modifier.padding(bottom = 12.dp)
         )
 
         LazyColumn {
-            items(items, key = { "${it.fileInfo.filename}|${it.fileInfo.fileHash}" }) { fileProgress ->
+            items(visible, key = { "${it.fileInfo.filename}|${it.fileInfo.fileHash}" }) { fileProgress ->
                 ProgressItemCard(fileProgress)
             }
         }

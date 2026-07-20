@@ -8,10 +8,11 @@ import kotlinx.coroutines.withContext
 import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.io.IOException
+import java.io.InputStream
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.net.SocketException
-import kotlin.math.min
+import java.security.MessageDigest
 
 // ============================================================================
 // BINARY PROTOCOL COMMANDS & RESPONSES
@@ -168,6 +169,25 @@ class SyncClient(private val config: ServerConfig) {
                 .map { sanitizeFilename(it) }
             return parts.joinToString("/")
         }
+
+        /**
+         * Stream-hash a file (64KB buffer) without loading it into a single
+         * [ByteArray]. Returns hex SHA-256 and byte length.
+         */
+        fun sha256AndLength(input: InputStream): Pair<String, Long> {
+            val digest = MessageDigest.getInstance("SHA-256")
+            val buf = ByteArray(BinaryProtocol.CHUNK_SIZE)
+            var total = 0L
+            while (true) {
+                val n = input.read(buf)
+                if (n < 0) break
+                if (n == 0) continue
+                digest.update(buf, 0, n)
+                total += n
+            }
+            val hex = digest.digest().joinToString("") { b -> "%02x".format(b) }
+            return hex to total
+        }
     }
 
     private fun handshakeUnlocked(): Result<Unit> {
@@ -251,19 +271,28 @@ class SyncClient(private val config: ServerConfig) {
             }
         }
 
+    /**
+     * Stream a file to the server in 64KB protocol chunks without loading the
+     * whole file into RAM (critical for DCIM / large videos).
+     *
+     * [fileInfo.fileSize] must match the number of bytes that will be read from
+     * [input] (or the stream length if size was queried accurately).
+     */
     suspend fun uploadFile(
         fileInfo: FileInfo,
-        fileData: ByteArray,
+        input: InputStream,
         onBytesSent: ((Long) -> Unit)? = null
     ): Result<Unit> =
         protocolCall("Upload (${fileInfo.filename})") { out, inp ->
+            val total = fileInfo.fileSize.coerceAtLeast(0L)
+
             // UPLOAD_START
             out.writeByte(BinaryProtocol.CMD_UPLOAD_START.toInt() and 0xFF)
             writeString(out, fileInfo.filename)
             writeString(out, fileInfo.fileHash)
             writeString(out, fileInfo.fileType)
             writeString(out, fileInfo.directory)
-            out.writeLong(fileData.size.toLong())
+            out.writeLong(total)
             out.flush()
 
             var response = inp.readByte()
@@ -271,21 +300,34 @@ class SyncClient(private val config: ServerConfig) {
                 throw IOException("Upload start rejected (code=${response.toUByte()})")
             }
 
-            var offset = 0
-            while (offset < fileData.size) {
-                val chunkSize = min(BinaryProtocol.CHUNK_SIZE, fileData.size - offset)
-                out.writeByte(BinaryProtocol.CMD_UPLOAD_CHUNK.toInt() and 0xFF)
-                out.writeInt(chunkSize)
-                out.write(fileData, offset, chunkSize)
-                out.flush()
+            val buffer = ByteArray(BinaryProtocol.CHUNK_SIZE)
+            var sent = 0L
+            if (total == 0L) {
+                // Empty file: no chunks.
+            } else {
+                while (sent < total) {
+                    val remaining = (total - sent).coerceAtMost(BinaryProtocol.CHUNK_SIZE.toLong()).toInt()
+                    val n = input.read(buffer, 0, remaining)
+                    if (n < 0) {
+                        throw IOException(
+                            "Unexpected end of stream at $sent / $total bytes for ${fileInfo.filename}"
+                        )
+                    }
+                    if (n == 0) continue
 
-                response = inp.readByte()
-                if (response != BinaryProtocol.RESP_OK) {
-                    throw IOException("Chunk rejected at offset $offset (code=${response.toUByte()})")
+                    out.writeByte(BinaryProtocol.CMD_UPLOAD_CHUNK.toInt() and 0xFF)
+                    out.writeInt(n)
+                    out.write(buffer, 0, n)
+                    out.flush()
+
+                    response = inp.readByte()
+                    if (response != BinaryProtocol.RESP_OK) {
+                        throw IOException("Chunk rejected at offset $sent (code=${response.toUByte()})")
+                    }
+
+                    sent += n
+                    onBytesSent?.invoke(sent)
                 }
-
-                offset += chunkSize
-                onBytesSent?.invoke(offset.toLong())
             }
 
             // UPLOAD_END
@@ -300,8 +342,22 @@ class SyncClient(private val config: ServerConfig) {
             if (response != BinaryProtocol.RESP_OK) {
                 throw IOException("Upload end rejected (code=${response.toUByte()})")
             }
-            onBytesSent?.invoke(fileData.size.toLong())
+            onBytesSent?.invoke(total)
         }
+
+    /** Convenience: upload from a fully buffered array (small files / tests). */
+    suspend fun uploadFile(
+        fileInfo: FileInfo,
+        fileData: ByteArray,
+        onBytesSent: ((Long) -> Unit)? = null
+    ): Result<Unit> {
+        val info = if (fileInfo.fileSize == fileData.size.toLong()) {
+            fileInfo
+        } else {
+            fileInfo.copy(fileSize = fileData.size.toLong())
+        }
+        return uploadFile(info, fileData.inputStream(), onBytesSent)
+    }
 
     suspend fun confirmDelete(): Result<Unit> =
         protocolCall("Delete confirm") { out, inp ->

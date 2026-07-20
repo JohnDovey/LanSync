@@ -5,6 +5,7 @@ import com.lansync.network.FileInfo
 import com.lansync.network.SyncClient
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import java.io.InputStream
 import java.util.concurrent.ConcurrentHashMap
 
 data class UploadProgress(
@@ -28,8 +29,7 @@ data class ConflictResolution(
 
 /**
  * Uploads files over a single [SyncClient] connection, one at a time.
- * Supports multi-batch runs so large folders can be processed without
- * holding every file in memory at once.
+ * Prefer [uploadFileStreaming] so large DCIM / SD-card media never load fully into RAM.
  */
 class UploadManager(
     private val syncClient: SyncClient,
@@ -46,17 +46,16 @@ class UploadManager(
         onProgressUpdate = callback
     }
 
-    /** Start a multi-batch sync (clears prior progress and conflict choices). */
     fun beginSession() {
         globalConflictResolution = null
         uploadProgress.clear()
         notifyProgress()
     }
 
-    /**
-     * Seed PENDING rows for known files before their bytes are loaded
-     * (so the UI can show total count early).
-     */
+    fun markFailed(fileInfo: FileInfo, error: String?) {
+        fail(progressKey(fileInfo), fileInfo, fileInfo.fileSize.coerceAtLeast(0), error)
+    }
+
     fun seedPending(files: List<FileInfo>) {
         for (fileInfo in files) {
             val key = progressKey(fileInfo)
@@ -70,71 +69,42 @@ class UploadManager(
                 )
             }
         }
-        notifyProgress()
+        // Cap notify cost for huge folders — UI reads getProgress() snapshots.
+        if (uploadProgress.size <= 200 || uploadProgress.size % 50 == 0) {
+            notifyProgress()
+        }
     }
 
     /**
-     * Upload one batch of files. Does **not** clear existing progress so
-     * callers can chunk large folders (e.g. 100 files at a time).
+     * Upload one file from a re-openable stream. [openStream] is called once for
+     * the upload body (hash/size must already be on [fileInfo]).
      */
-    suspend fun uploadFiles(
-        files: List<Pair<FileInfo, ByteArray>>,
-        onConflict: suspend (FileInfo) -> ConflictResolution?,
-        clearExisting: Boolean = true
-    ): Result<UploadSummary> = withContext(Dispatchers.IO) {
-        if (clearExisting) {
-            beginSession()
-        }
-
-        files.forEach { (fileInfo, fileData) ->
-            val key = progressKey(fileInfo)
-            uploadProgress[key] = UploadProgress(
-                fileInfo = fileInfo,
-                currentBytes = 0,
-                totalBytes = fileData.size.toLong(),
-                percentage = 0,
-                status = UploadStatus.PENDING
-            )
-        }
-        notifyProgress()
-
-        try {
-            for ((fileInfo, fileData) in files) {
-                uploadSingleFile(fileInfo, fileData, onConflict)
-            }
-            Result.success(generateSummary())
-        } catch (e: Exception) {
-            Log.e(TAG, "Upload batch failed", e)
-            Result.failure(e)
-        }
-    }
-
-    private suspend fun uploadSingleFile(
+    suspend fun uploadFileStreaming(
         fileInfo: FileInfo,
-        fileData: ByteArray,
+        openStream: () -> InputStream?,
         onConflict: suspend (FileInfo) -> ConflictResolution?
-    ) {
+    ): Unit = withContext(Dispatchers.IO) {
         val key = progressKey(fileInfo)
+        val total = fileInfo.fileSize.coerceAtLeast(0L)
         try {
-            updateProgress(key, fileInfo, UploadStatus.UPLOADING, currentBytes = 0, totalBytes = fileData.size.toLong())
+            updateProgress(key, fileInfo, UploadStatus.UPLOADING, currentBytes = 0, totalBytes = total)
 
-            // One automatic reconnect+retry if the pipe dies mid-transfer.
             var dupResult = syncClient.checkDuplicate(fileInfo)
             if (dupResult.isFailure && SyncClient.isConnectionError(dupResult.exceptionOrNull())) {
                 Log.w(TAG, "Connection lost before duplicate check; reconnecting")
                 val re = syncClient.reconnect()
                 if (re.isFailure) {
-                    fail(key, fileInfo, fileData.size.toLong(), re.exceptionOrNull()?.message)
-                    return
+                    fail(key, fileInfo, total, re.exceptionOrNull()?.message)
+                    return@withContext
                 }
                 dupResult = syncClient.checkDuplicate(fileInfo)
             }
             if (dupResult.isFailure) {
-                fail(key, fileInfo, fileData.size.toLong(), dupResult.exceptionOrNull()?.message)
-                return
+                fail(key, fileInfo, total, dupResult.exceptionOrNull()?.message)
+                return@withContext
             }
 
-            val dup = dupResult.getOrNull() ?: return
+            val dup = dupResult.getOrNull() ?: return@withContext
 
             if (dup.isDuplicate && !dup.shouldUpdate) {
                 val global = globalConflictResolution
@@ -150,38 +120,38 @@ class UploadManager(
                         key,
                         fileInfo,
                         UploadStatus.SKIPPED,
-                        currentBytes = fileData.size.toLong(),
-                        totalBytes = fileData.size.toLong()
+                        currentBytes = total,
+                        totalBytes = total
                     )
-                    return
+                    return@withContext
                 }
             }
 
-            var uploadResult = syncClient.uploadFile(fileInfo, fileData) { sent ->
-                updateProgress(
-                    key,
-                    fileInfo,
-                    UploadStatus.UPLOADING,
-                    currentBytes = sent,
-                    totalBytes = fileData.size.toLong()
-                )
-            }
-            if (uploadResult.isFailure && SyncClient.isConnectionError(uploadResult.exceptionOrNull())) {
-                Log.w(TAG, "Connection lost during upload of ${fileInfo.filename}; reconnecting and retrying once")
-                val re = syncClient.reconnect()
-                if (re.isSuccess) {
-                    uploadResult = syncClient.uploadFile(fileInfo, fileData) { sent ->
+            suspend fun doUpload(): Result<Unit> {
+                val stream = openStream()
+                    ?: return Result.failure(Exception("Cannot open stream for ${fileInfo.filename}"))
+                return stream.use { input ->
+                    syncClient.uploadFile(fileInfo, input) { sent ->
                         updateProgress(
                             key,
                             fileInfo,
                             UploadStatus.UPLOADING,
                             currentBytes = sent,
-                            totalBytes = fileData.size.toLong()
+                            totalBytes = total
                         )
                     }
+                }
+            }
+
+            var uploadResult = doUpload()
+            if (uploadResult.isFailure && SyncClient.isConnectionError(uploadResult.exceptionOrNull())) {
+                Log.w(TAG, "Connection lost during upload of ${fileInfo.filename}; reconnecting and retrying once")
+                val re = syncClient.reconnect()
+                if (re.isSuccess) {
+                    uploadResult = doUpload()
                 } else {
-                    fail(key, fileInfo, fileData.size.toLong(), re.exceptionOrNull()?.message)
-                    return
+                    fail(key, fileInfo, total, re.exceptionOrNull()?.message)
+                    return@withContext
                 }
             }
 
@@ -190,24 +160,51 @@ class UploadManager(
                     key,
                     fileInfo,
                     UploadStatus.COMPLETED,
-                    currentBytes = fileData.size.toLong(),
-                    totalBytes = fileData.size.toLong()
+                    currentBytes = total,
+                    totalBytes = total
                 )
                 Log.i(TAG, "Successfully uploaded ${fileInfo.filename}")
             } else {
                 fail(
                     key,
                     fileInfo,
-                    fileData.size.toLong(),
+                    total,
                     uploadResult.exceptionOrNull()?.message ?: "Upload failed"
                 )
             }
+        } catch (e: OutOfMemoryError) {
+            // Rare if streaming works; still catch to avoid process death when possible.
+            Log.e(TAG, "OOM uploading ${fileInfo.filename}", e)
+            fail(key, fileInfo, total, "Out of memory (file too large for device)")
+            System.gc()
         } catch (e: Exception) {
             Log.e(TAG, "Upload error for ${fileInfo.filename}", e)
             if (SyncClient.isConnectionError(e)) {
                 runCatching { syncClient.reconnect() }
             }
-            fail(key, fileInfo, fileData.size.toLong(), e.message)
+            fail(key, fileInfo, total, e.message)
+        }
+    }
+
+    /** Legacy path: still available for tiny files / tests. */
+    suspend fun uploadFiles(
+        files: List<Pair<FileInfo, ByteArray>>,
+        onConflict: suspend (FileInfo) -> ConflictResolution?,
+        clearExisting: Boolean = true
+    ): Result<UploadSummary> = withContext(Dispatchers.IO) {
+        if (clearExisting) beginSession()
+        try {
+            for ((fileInfo, fileData) in files) {
+                uploadFileStreaming(
+                    fileInfo = fileInfo.copy(fileSize = fileData.size.toLong()),
+                    openStream = { fileData.inputStream() },
+                    onConflict = onConflict
+                )
+            }
+            Result.success(generateSummary())
+        } catch (e: Exception) {
+            Log.e(TAG, "Upload batch failed", e)
+            Result.failure(e)
         }
     }
 
@@ -255,7 +252,7 @@ class UploadManager(
         onProgressUpdate?.invoke(uploadProgress.toMap())
     }
 
-    private fun generateSummary(): UploadSummary {
+    fun generateSummary(): UploadSummary {
         val progress = uploadProgress.values
         return UploadSummary(
             total = progress.size,
