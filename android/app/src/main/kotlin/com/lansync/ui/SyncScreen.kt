@@ -27,7 +27,9 @@ import com.lansync.manager.UploadStatus
 import com.lansync.network.FileInfo
 import com.lansync.network.ServerConfig
 import com.lansync.network.SyncClient
+import kotlin.coroutines.resume
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
 import java.io.File
 import java.security.MessageDigest
 
@@ -430,11 +432,10 @@ fun ProgressItemCard(progress: UploadProgress) {
             Spacer(modifier = Modifier.height(8.dp))
 
             LinearProgressIndicator(
-                progress = progress.percentage / 100f,
+                progress = { progress.percentage / 100f },
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(8.dp),
-                shape = RoundedCornerShape(4.dp)
+                    .height(8.dp)
             )
 
             Spacer(modifier = Modifier.height(8.dp))

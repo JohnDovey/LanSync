@@ -4,6 +4,7 @@ import android.util.Log
 import com.lansync.network.FileInfo
 import com.lansync.network.SyncClient
 import kotlinx.coroutines.*
+import kotlinx.coroutines.sync.Semaphore
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 
