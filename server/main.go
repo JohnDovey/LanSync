@@ -289,13 +289,37 @@ func (s *Server) getHistory(userID, deviceID int64, limit int) ([]SyncHistory, e
 // FILE STORAGE
 // ============================================================================
 
-func (s *Server) getStoragePath(userID, deviceID int64, fileType, filename string) string {
-	// users/{userID}/device{deviceID}/{fileType}/filename
-	return filepath.Join(
+// getStoragePath builds the on-disk path for an uploaded file.
+//
+// Layout:
+//
+//	storage/users/{userID}/device{deviceID}/…nested dirs…/file
+//
+// Folder syncs send a relative path (directory + filename, or a multi-segment
+// filename). Flat picks use directory/fileType as a single bucket.
+func (s *Server) getStoragePath(userID, deviceID int64, fileType, directory, filename string) string {
+	base := filepath.Join(
 		s.config.StoragePath,
-		fmt.Sprintf("users/%d/device%d/%s", userID, deviceID, sanitizePathComponent(fileType)),
-		sanitizeFilename(filename),
+		fmt.Sprintf("users/%d/device%d", userID, deviceID),
 	)
+
+	// Full relative path encoded in filename (folder sync identity key).
+	if strings.ContainsAny(filename, `/\`) {
+		rel := sanitizeRelativePath(filename)
+		if rel == "" {
+			rel = "file"
+		}
+		return filepath.Join(base, filepath.FromSlash(rel))
+	}
+
+	dir := sanitizeRelativePath(directory)
+	if dir == "" {
+		dir = sanitizePathComponent(fileType)
+	}
+	if dir == "" {
+		dir = "files"
+	}
+	return filepath.Join(base, filepath.FromSlash(dir), sanitizeFilename(filename))
 }
 
 // sanitizeFilename strips directories and characters that are illegal on
@@ -339,11 +363,43 @@ func sanitizeFilename(name string) string {
 }
 
 func sanitizePathComponent(name string) string {
-	name = sanitizeFilename(name)
-	if name == "file" && name != "" {
-		// keep
+	return sanitizeFilename(name)
+}
+
+// sanitizeRelativePath sanitizes each path segment and joins with '/'.
+// ".." and empty segments are dropped (no path traversal).
+// Empty input yields empty string (caller decides the default).
+func sanitizeRelativePath(p string) string {
+	p = strings.ReplaceAll(p, `\`, `/`)
+	parts := strings.Split(p, "/")
+	clean := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" || part == "." || part == ".." {
+			continue
+		}
+		clean = append(clean, sanitizeFilename(part))
 	}
-	return name
+	return strings.Join(clean, "/")
+}
+
+// sanitizeDirectory normalizes a directory field; empty stays empty.
+func sanitizeDirectory(p string) string {
+	return sanitizeRelativePath(p)
+}
+
+// sanitizeFileKey normalizes a client-supplied filename that may be either a
+// bare name or a folder-relative path (used as the unique DB key).
+func sanitizeFileKey(name string) string {
+	name = strings.ReplaceAll(name, `\`, `/`)
+	if strings.Contains(name, "/") {
+		key := sanitizeRelativePath(name)
+		if key == "" {
+			return "file"
+		}
+		return key
+	}
+	return sanitizeFilename(name)
 }
 
 // isBenignDisconnect is true for normal client disconnects that should not
@@ -552,7 +608,7 @@ func (s *Server) handleCheckDuplicate(reader *bufio.Reader, writer *bufio.Writer
 	if err != nil {
 		return err
 	}
-	filename = sanitizeFilename(filename)
+	filename = sanitizeFileKey(filename)
 	fileSize, err := readUint64(reader)
 	if err != nil {
 		return err
@@ -586,7 +642,7 @@ func (s *Server) handleUploadStart(conn net.Conn, reader *bufio.Reader, writer *
 	if err != nil {
 		return err
 	}
-	filename = sanitizeFilename(filename)
+	filename = sanitizeFileKey(filename)
 	fileHash, err := readString(reader)
 	if err != nil {
 		return err
@@ -599,12 +655,13 @@ func (s *Server) handleUploadStart(conn net.Conn, reader *bufio.Reader, writer *
 	if err != nil {
 		return err
 	}
+	directory = sanitizeDirectory(directory)
 	fileSize, err := readUint64(reader)
 	if err != nil {
 		return err
 	}
 
-	filePath := s.getStoragePath(userID, deviceID, fileType, filename)
+	filePath := s.getStoragePath(userID, deviceID, fileType, directory, filename)
 	if err := os.MkdirAll(filepath.Dir(filePath), 0755); err != nil {
 		fmt.Printf("MkdirAll failed for %s: %v\n", filePath, err)
 		return writeResp(writer, RESP_ERROR)
@@ -615,6 +672,8 @@ func (s *Server) handleUploadStart(conn net.Conn, reader *bufio.Reader, writer *
 		fmt.Printf("Create failed for %s: %v\n", filePath, err)
 		return writeResp(writer, RESP_ERROR)
 	}
+
+	fmt.Printf("Uploading → %s\n", filePath)
 
 	uploads.set(conn, &uploadSession{
 		userID:    userID,
@@ -667,7 +726,7 @@ func (s *Server) handleUploadEnd(conn net.Conn, reader *bufio.Reader, writer *bu
 	if err != nil {
 		return err
 	}
-	filename = sanitizeFilename(filename)
+	filename = sanitizeFileKey(filename)
 	fileHash, err := readString(reader)
 	if err != nil {
 		return err
@@ -680,6 +739,7 @@ func (s *Server) handleUploadEnd(conn net.Conn, reader *bufio.Reader, writer *bu
 	if err != nil {
 		return err
 	}
+	directory = sanitizeDirectory(directory)
 
 	sess := uploads.get(conn)
 	if sess == nil || sess.filename != filename {

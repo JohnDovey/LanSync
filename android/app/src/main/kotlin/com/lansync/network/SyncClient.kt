@@ -155,6 +155,19 @@ class SyncClient(private val config: ServerConfig) {
             }
             return base.take(200)
         }
+
+        /**
+         * Sanitize a folder-relative path, keeping `/` separators so the server
+         * can recreate the directory tree. Drops `.` / `..` segments.
+         */
+        fun sanitizeRelativePath(path: String): String {
+            val parts = path.replace('\\', '/')
+                .split('/')
+                .map { it.trim() }
+                .filter { it.isNotEmpty() && it != "." && it != ".." }
+                .map { sanitizeFilename(it) }
+            return parts.joinToString("/")
+        }
     }
 
     private fun handshakeUnlocked(): Result<Unit> {

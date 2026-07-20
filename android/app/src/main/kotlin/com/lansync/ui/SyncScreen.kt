@@ -127,8 +127,8 @@ class SyncViewModel(private val context: Context) : ViewModel() {
         }
     }
 
-    fun startSync(selectedFiles: List<Uri>) {
-        if (selectedFiles.isEmpty()) return
+    fun startSync(selectedItems: List<SelectedItem>) {
+        if (selectedItems.isEmpty()) return
         if (uploadManager == null || syncClient?.isConnected() != true) {
             _uiState.value = UiState.Error("Not connected to server")
             return
@@ -140,11 +140,11 @@ class SyncViewModel(private val context: Context) : ViewModel() {
             clearDeleteState()
 
             try {
-                val prepared = selectedFiles.map { uri ->
-                    val fileData = context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
-                        ?: throw Exception("Cannot read file: ${displayName(uri)}")
-                    val fileInfo = buildFileInfo(uri, fileData)
-                    PreparedUpload(uri, fileInfo, fileData)
+                val prepared = selectedItems.map { item ->
+                    val fileData = context.contentResolver.openInputStream(item.uri)?.use { it.readBytes() }
+                        ?: throw Exception("Cannot read file: ${item.displayLabel()}")
+                    val fileInfo = buildFileInfo(item, fileData)
+                    PreparedUpload(item.uri, fileInfo, fileData)
                 }
 
                 val result = uploadManager?.uploadFiles(
@@ -218,23 +218,39 @@ class SyncViewModel(private val context: Context) : ViewModel() {
         return uri.lastPathSegment?.substringAfterLast('/') ?: "file"
     }
 
-    private fun buildFileInfo(uri: Uri, fileData: ByteArray): FileInfo {
-        val filename = SyncClient.sanitizeFilename(displayName(uri))
-        val mimeType = context.contentResolver.getType(uri).orEmpty()
-        val fileType = when {
-            mimeType.startsWith("image/") || mimeType.startsWith("video/") -> "photos"
-            else -> "documents"
-        }
+    private fun buildFileInfo(item: SelectedItem, fileData: ByteArray): FileInfo {
+        val mimeType = context.contentResolver.getType(item.uri).orEmpty()
+        val relative = item.relativePath?.let { SyncClient.sanitizeRelativePath(it) }.orEmpty()
 
-        return FileInfo(
-            filename = filename,
-            fileHash = calculateHash(fileData),
-            fileType = fileType,
-            directory = fileType,
-            filePath = uri.toString(),
-            fileSize = fileData.size.toLong(),
-            mimeType = mimeType
-        )
+        return if (relative.isNotEmpty()) {
+            // Folder sync: preserve tree. Filename is the full relative path so
+            // the DB unique key and server storage recreate nested folders.
+            val dir = relative.substringBeforeLast('/', missingDelimiterValue = "")
+            FileInfo(
+                filename = relative,
+                fileHash = calculateHash(fileData),
+                fileType = "folders",
+                directory = dir,
+                filePath = item.uri.toString(),
+                fileSize = fileData.size.toLong(),
+                mimeType = mimeType
+            )
+        } else {
+            val filename = SyncClient.sanitizeFilename(displayName(item.uri))
+            val fileType = when {
+                mimeType.startsWith("image/") || mimeType.startsWith("video/") -> "photos"
+                else -> "documents"
+            }
+            FileInfo(
+                filename = filename,
+                fileHash = calculateHash(fileData),
+                fileType = fileType,
+                directory = fileType,
+                filePath = item.uri.toString(),
+                fileSize = fileData.size.toLong(),
+                mimeType = mimeType
+            )
+        }
     }
 
     private fun calculateHash(data: ByteArray): String {
@@ -448,16 +464,21 @@ class SyncViewModel(private val context: Context) : ViewModel() {
     }
 
     /**
-     * Recursively list file document URIs under a tree URI from [OpenDocumentTree].
-     * Directories are walked; only non-directory documents are returned.
+     * Recursively list files under a tree URI from [OpenDocumentTree].
+     * Each entry includes a relative path starting with the selected folder name
+     * so the server can recreate the same tree
+     * (e.g. `Camera/Vacation/IMG_001.jpg`).
      */
-    suspend fun listFilesInTree(treeUri: Uri, maxFiles: Int = MAX_FOLDER_FILES): List<Uri> =
+    suspend fun listFilesInTree(treeUri: Uri, maxFiles: Int = MAX_FOLDER_FILES): List<SelectedItem> =
         withContext(Dispatchers.IO) {
-            val result = ArrayList<Uri>()
+            val result = ArrayList<SelectedItem>()
             try {
+                val rootId = DocumentsContract.getTreeDocumentId(treeUri)
+                val rootName = treeRootDisplayName(treeUri, rootId)
                 walkDocumentTree(
                     treeUri = treeUri,
-                    documentId = DocumentsContract.getTreeDocumentId(treeUri),
+                    documentId = rootId,
+                    relativeDir = rootName,
                     out = result,
                     maxFiles = maxFiles
                 )
@@ -467,30 +488,62 @@ class SyncViewModel(private val context: Context) : ViewModel() {
             result
         }
 
+    private fun treeRootDisplayName(treeUri: Uri, rootDocumentId: String): String {
+        // Prefer the document display name; fall back to the last path segment of the doc id.
+        val docUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, rootDocumentId)
+        val fromQuery = displayName(docUri)
+        if (fromQuery.isNotBlank() && fromQuery != "file") {
+            return SyncClient.sanitizeFilename(fromQuery)
+        }
+        val fromId = rootDocumentId
+            .substringAfterLast(':')
+            .substringAfterLast('/')
+            .ifBlank { "folder" }
+        return SyncClient.sanitizeFilename(fromId)
+    }
+
     private fun walkDocumentTree(
         treeUri: Uri,
         documentId: String,
-        out: MutableList<Uri>,
+        relativeDir: String,
+        out: MutableList<SelectedItem>,
         maxFiles: Int
     ) {
         if (out.size >= maxFiles) return
         val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, documentId)
         val projection = arrayOf(
             DocumentsContract.Document.COLUMN_DOCUMENT_ID,
-            DocumentsContract.Document.COLUMN_MIME_TYPE
+            DocumentsContract.Document.COLUMN_MIME_TYPE,
+            DocumentsContract.Document.COLUMN_DISPLAY_NAME
         )
         try {
             context.contentResolver.query(childrenUri, projection, null, null, null)?.use { cursor ->
                 val idIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
                 val mimeIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_MIME_TYPE)
+                val nameIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
                 if (idIdx < 0 || mimeIdx < 0) return
                 while (cursor.moveToNext() && out.size < maxFiles) {
                     val childId = cursor.getString(idIdx) ?: continue
                     val mime = cursor.getString(mimeIdx).orEmpty()
-                    if (mime == DocumentsContract.Document.MIME_TYPE_DIR) {
-                        walkDocumentTree(treeUri, childId, out, maxFiles)
+                    val childName = if (nameIdx >= 0) {
+                        cursor.getString(nameIdx)?.takeIf { it.isNotBlank() }
                     } else {
-                        out.add(DocumentsContract.buildDocumentUriUsingTree(treeUri, childId))
+                        null
+                    } ?: childId.substringAfterLast(':').substringAfterLast('/')
+
+                    if (mime == DocumentsContract.Document.MIME_TYPE_DIR) {
+                        val subDirName = SyncClient.sanitizeFilename(childName)
+                        val nextDir = if (relativeDir.isBlank()) subDirName else "$relativeDir/$subDirName"
+                        walkDocumentTree(treeUri, childId, nextDir, out, maxFiles)
+                    } else {
+                        val fileName = SyncClient.sanitizeFilename(childName)
+                        val relativePath = if (relativeDir.isBlank()) fileName else "$relativeDir/$fileName"
+                        out.add(
+                            SelectedItem(
+                                uri = DocumentsContract.buildDocumentUriUsingTree(treeUri, childId),
+                                relativePath = relativePath
+                            )
+                        )
                     }
                 }
             }
@@ -541,6 +594,17 @@ data class DeleteStatus(
     val failed: Int,
     val message: String
 )
+
+/** A user-selected file, optionally with a folder-relative path for tree sync. */
+data class SelectedItem(
+    val uri: Uri,
+    /** e.g. `Camera/Vacation/IMG_001.jpg` when picked via Folder. */
+    val relativePath: String? = null
+) {
+    fun displayLabel(): String = relativePath?.takeIf { it.isNotBlank() }
+        ?: uri.lastPathSegment?.substringAfterLast('/')
+        ?: "file"
+}
 
 sealed class UiState {
     object Idle : UiState()
@@ -691,15 +755,19 @@ fun ConnectScreen(viewModel: SyncViewModel) {
 
 @Composable
 fun FilePickerScreen(viewModel: SyncViewModel) {
-    var selectedFiles by remember { mutableStateOf<List<Uri>>(emptyList()) }
+    var selectedItems by remember { mutableStateOf<List<SelectedItem>>(emptyList()) }
     var isScanningFolder by remember { mutableStateOf(false) }
     var statusMessage by remember { mutableStateOf<String?>(null) }
     val scope = rememberCoroutineScope()
 
+    fun addItems(items: List<SelectedItem>) {
+        if (items.isEmpty()) return
+        viewModel.takePersistablePermissions(items.map { it.uri })
+        selectedItems = (selectedItems + items).distinctBy { it.uri.toString() to it.relativePath }
+    }
+
     fun addUris(uris: List<Uri>) {
-        if (uris.isEmpty()) return
-        viewModel.takePersistablePermissions(uris)
-        selectedFiles = (selectedFiles + uris).distinct()
+        addItems(uris.map { SelectedItem(uri = it, relativePath = null) })
     }
 
     val pickImages = rememberLauncherForActivityResult(
@@ -747,11 +815,12 @@ fun FilePickerScreen(viewModel: SyncViewModel) {
             if (files.isEmpty()) {
                 statusMessage = "No files found in that folder"
             } else {
-                addUris(files)
+                addItems(files)
+                val rootHint = files.first().relativePath?.substringBefore('/') ?: "folder"
                 statusMessage = if (files.size >= SyncViewModel.MAX_FOLDER_FILES) {
-                    "Added first ${files.size} files from folder (limit reached)"
+                    "Added first ${files.size} files from “$rootHint” (limit reached) — structure preserved"
                 } else {
-                    "Added ${files.size} file(s) from folder"
+                    "Added ${files.size} file(s) from “$rootHint” — folder structure will be recreated on server"
                 }
             }
             isScanningFolder = false
@@ -774,8 +843,8 @@ fun FilePickerScreen(viewModel: SyncViewModel) {
 
         // Primary action — always on screen, never at the bottom edge.
         Button(
-            onClick = { viewModel.startSync(selectedFiles) },
-            enabled = selectedFiles.isNotEmpty() && !isScanningFolder,
+            onClick = { viewModel.startSync(selectedItems) },
+            enabled = selectedItems.isNotEmpty() && !isScanningFolder,
             modifier = Modifier
                 .fillMaxWidth()
                 .height(56.dp),
@@ -784,10 +853,10 @@ fun FilePickerScreen(viewModel: SyncViewModel) {
             Icon(Icons.Default.CloudUpload, contentDescription = null)
             Spacer(modifier = Modifier.width(8.dp))
             Text(
-                if (selectedFiles.isEmpty()) {
+                if (selectedItems.isEmpty()) {
                     "Select files below, then sync"
                 } else {
-                    "Start Sync (${selectedFiles.size})"
+                    "Start Sync (${selectedItems.size})"
                 },
                 fontSize = 16.sp,
                 fontWeight = FontWeight.SemiBold
@@ -888,14 +957,14 @@ fun FilePickerScreen(viewModel: SyncViewModel) {
             verticalAlignment = Alignment.CenterVertically
         ) {
             Text(
-                if (selectedFiles.isEmpty()) "No files selected" else "Selected (${selectedFiles.size})",
+                if (selectedItems.isEmpty()) "No files selected" else "Selected (${selectedItems.size})",
                 fontSize = 16.sp,
                 fontWeight = FontWeight.SemiBold
             )
-            if (selectedFiles.isNotEmpty()) {
+            if (selectedItems.isNotEmpty()) {
                 TextButton(
                     onClick = {
-                        selectedFiles = emptyList()
+                        selectedItems = emptyList()
                         statusMessage = null
                     },
                     enabled = !isScanningFolder
@@ -905,24 +974,30 @@ fun FilePickerScreen(viewModel: SyncViewModel) {
             }
         }
 
-        if (selectedFiles.isEmpty() && !isScanningFolder) {
+        if (selectedItems.isEmpty() && !isScanningFolder) {
             Text(
-                "Photos / Videos / Documents / Files pick individual files. Folder picks an entire directory.",
+                "Folder pick recreates the folder name and all subfolders on the server.",
                 color = Color.Gray,
                 modifier = Modifier.padding(vertical = 8.dp)
             )
-        } else if (selectedFiles.isNotEmpty()) {
+        } else if (selectedItems.isNotEmpty()) {
             LazyColumn(
                 modifier = Modifier
                     .fillMaxWidth()
                     .weight(1f),
                 contentPadding = PaddingValues(bottom = 16.dp)
             ) {
-                items(selectedFiles, key = { it.toString() }) { uri ->
+                items(
+                    selectedItems,
+                    key = { "${it.uri}|${it.relativePath.orEmpty()}" }
+                ) { item ->
                     FileItemCard(
-                        filename = viewModel.displayName(uri),
+                        filename = item.relativePath
+                            ?: viewModel.displayName(item.uri),
                         onRemove = {
-                            selectedFiles = selectedFiles.filterNot { it == uri }
+                            selectedItems = selectedItems.filterNot {
+                                it.uri == item.uri && it.relativePath == item.relativePath
+                            }
                         }
                     )
                 }
