@@ -1,9 +1,21 @@
 # Go build artifacts
-/lansync
-/lansync.exe
-*.exe
+/server/lansync-server
+/server/lansync-server.exe
 *.test
 *.out
+
+# Server runtime data (DB + uploaded files)
+/server/syncserver_data/
+
+# Android / Gradle
+android/local.properties
+android/**/build/
+android/.gradle/
+android/**/*.iml
+android/.idea/
+android/**/captures/
+android/**/.externalNativeBuild/
+android/**/.cxx/
 
 # macOS
 .DS_Store

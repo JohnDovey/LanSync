@@ -1,0 +1,29 @@
+---
+description: Android Gradle build conventions, duplicated from the sibling ClonesApp project
+globs: android/**
+alwaysApply: false
+---
+
+# Android build setup
+
+`android/` follows the `ClonesApp` (`/Volumes/JohnDovey/Projects/ClonesApp`) setup, per
+WalkieTalkie's `android-build.mdc` precedent:
+
+- **`android/local.properties`**: `sdk.dir=/Volumes/JohnDovey/Android/Sdk` (gitignored,
+  machine-specific — regenerate on a new machine, don't commit).
+- **`android/gradle.properties`**: configuration-cache enabled, AndroidX, non-transitive R
+  class — see the file itself for the exact contents.
+- **`android/android-build.sh`**: wrapper script that sources `~/source-john-dovey.sh --quiet`,
+  cds to its own directory, chmods `gradlew` executable, defaults to `assembleDebug` when no
+  args are given, and forwards all args/flags to `./gradlew`.
+- **`android/settings.gradle.kts`**: enables `STABLE_CONFIGURATION_CACHE`; uses
+  `google()`/`mavenCentral()`/`gradlePluginPortal()` repos with `FAIL_ON_PROJECT_REPOS` mode.
+- **Versions**: matched to ClonesApp's current pins as of 2026-07 (AGP 8.13.2, Kotlin 2.0.0,
+  compileSdk/targetSdk 35, Java 17, compose-bom 2024.09.00). Kotlin 2.0 uses the
+  `kotlin("plugin.compose")` Gradle plugin instead of the old
+  `composeOptions { kotlinCompilerExtensionVersion }` block — don't reintroduce that block.
+- **Gradle wrapper**: 9.5.1, matching ClonesApp's wrapper (generated via
+  `gradle wrapper --gradle-version 9.5.1` from the locally installed `gradle`).
+
+If ClonesApp's pinned versions move on again, re-check there before bumping this project's —
+don't drift independently.
