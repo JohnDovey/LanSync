@@ -334,6 +334,9 @@ class SyncViewModel(private val context: Context) : ViewModel() {
         _deleteStatus.value = DeleteStatus(
             deleted = 0,
             failed = 0,
+            total = 0,
+            processed = 0,
+            inProgress = false,
             message = "Local files kept on device"
         )
         _deletableUris.value = emptyList()
@@ -342,6 +345,7 @@ class SyncViewModel(private val context: Context) : ViewModel() {
     /**
      * User chose to remove successfully synced files from the device.
      * Some media URIs require a system confirmation sheet (API 30+).
+     * Progress is published as [DeleteStatus] (x/total + fraction).
      */
     fun confirmDeleteLocalFiles() {
         val uris = _deletableUris.value
@@ -352,24 +356,62 @@ class SyncViewModel(private val context: Context) : ViewModel() {
 
         viewModelScope.launch {
             _showDeletePrompt.value = false
-            _deleteStatus.value = DeleteStatus(deleted = 0, failed = 0, message = "Deleting…")
-
-            val directOk = mutableListOf<Uri>()
+            val total = uris.size
+            var deleted = 0
+            var failed = 0
             val needConsent = mutableListOf<Uri>()
-            val failed = mutableListOf<Uri>()
 
-            withContext(Dispatchers.IO) {
-                for (uri in uris) {
-                    when (tryDeleteUri(uri)) {
-                        DeleteAttempt.Success -> directOk.add(uri)
-                        DeleteAttempt.NeedsUserConsent -> needConsent.add(uri)
-                        DeleteAttempt.Failed -> failed.add(uri)
-                    }
-                }
+            fun publish(
+                processed: Int,
+                current: String?,
+                inProgress: Boolean,
+                message: String
+            ) {
+                _deleteStatus.value = DeleteStatus(
+                    deleted = deleted,
+                    failed = failed,
+                    total = total,
+                    processed = processed,
+                    inProgress = inProgress,
+                    currentName = current,
+                    message = message
+                )
             }
 
-            directDeletedCount = directOk.size
-            directFailedCount = failed.size
+            publish(
+                processed = 0,
+                current = null,
+                inProgress = true,
+                message = "Deleting 0 / $total…"
+            )
+
+            for ((index, uri) in uris.withIndex()) {
+                val label = displayName(uri)
+                publish(
+                    processed = index,
+                    current = label,
+                    inProgress = true,
+                    message = "Deleting ${index + 1} / $total…"
+                )
+
+                val attempt = withContext(Dispatchers.IO) { tryDeleteUri(uri) }
+                when (attempt) {
+                    DeleteAttempt.Success -> deleted++
+                    DeleteAttempt.NeedsUserConsent -> needConsent.add(uri)
+                    DeleteAttempt.Failed -> failed++
+                }
+
+                publish(
+                    processed = index + 1,
+                    current = label,
+                    inProgress = true,
+                    message = "Deleted $deleted / $total" +
+                        if (failed > 0) " ($failed failed)" else ""
+                )
+            }
+
+            directDeletedCount = deleted
+            directFailedCount = failed
 
             // Notify server that the client chose the post-sync delete path.
             runCatching { syncClient?.confirmDelete() }
@@ -379,21 +421,24 @@ class SyncViewModel(private val context: Context) : ViewModel() {
                     val request = MediaStore.createDeleteRequest(context.contentResolver, needConsent)
                     systemDeleteUris = needConsent
                     _pendingSystemDelete.value = request.intentSender
-                    _deleteStatus.value = DeleteStatus(
-                        deleted = directOk.size,
-                        failed = failed.size,
-                        message = "Confirm deletion in the system dialog…"
+                    publish(
+                        processed = total - needConsent.size,
+                        current = null,
+                        inProgress = true,
+                        message = "Deleted $deleted / $total — confirm ${needConsent.size} more in system dialog…"
                     )
                     return@launch
                 } catch (e: Exception) {
                     Log.e(TAG, "createDeleteRequest failed", e)
-                    directFailedCount += needConsent.size
+                    failed += needConsent.size
+                    directFailedCount = failed
                 }
             } else if (needConsent.isNotEmpty()) {
-                directFailedCount += needConsent.size
+                failed += needConsent.size
+                directFailedCount = failed
             }
 
-            finishDeleteSummary(extraDeleted = 0, extraFailed = 0)
+            finishDeleteSummary(extraDeleted = 0, extraFailed = 0, total = total)
             _deletableUris.value = emptyList()
         }
     }
@@ -405,7 +450,10 @@ class SyncViewModel(private val context: Context) : ViewModel() {
 
         val extraDeleted = if (granted) pending.size else 0
         val extraFailed = if (granted) 0 else pending.size
-        finishDeleteSummary(extraDeleted, extraFailed)
+        val total = (_deleteStatus.value?.total ?: 0).coerceAtLeast(
+            directDeletedCount + directFailedCount + pending.size
+        )
+        finishDeleteSummary(extraDeleted, extraFailed, total = total)
         _deletableUris.value = emptyList()
     }
 
@@ -413,19 +461,29 @@ class SyncViewModel(private val context: Context) : ViewModel() {
         _pendingSystemDelete.value = null
     }
 
-    private fun finishDeleteSummary(extraDeleted: Int, extraFailed: Int) {
+    private fun finishDeleteSummary(extraDeleted: Int, extraFailed: Int, total: Int = 0) {
         val deleted = directDeletedCount + extraDeleted
         val failed = directFailedCount + extraFailed
-        _deleteStatus.value = when {
+        val resolvedTotal = if (total > 0) total else (deleted + failed)
+        val message = when {
             deleted > 0 && failed == 0 ->
-                DeleteStatus(deleted, failed, "Deleted $deleted file(s) from this device")
+                "Deleted $deleted / $resolvedTotal file(s) from this device"
             deleted > 0 ->
-                DeleteStatus(deleted, failed, "Deleted $deleted file(s); $failed could not be removed")
+                "Deleted $deleted / $resolvedTotal; $failed could not be removed"
             failed > 0 ->
-                DeleteStatus(deleted, failed, "Could not delete $failed file(s). Android may block removal for some gallery items.")
+                "Could not delete $failed / $resolvedTotal file(s). Android may block removal for some gallery items."
             else ->
-                DeleteStatus(0, 0, "No files deleted")
+                "No files deleted"
         }
+        _deleteStatus.value = DeleteStatus(
+            deleted = deleted,
+            failed = failed,
+            total = resolvedTotal,
+            processed = resolvedTotal,
+            inProgress = false,
+            currentName = null,
+            message = message
+        )
         directDeletedCount = 0
         directFailedCount = 0
     }
@@ -657,8 +715,16 @@ class SyncViewModel(private val context: Context) : ViewModel() {
 data class DeleteStatus(
     val deleted: Int,
     val failed: Int,
+    val total: Int = 0,
+    /** How many files have been attempted so far (deleted + failed + skipped). */
+    val processed: Int = deleted + failed,
+    val inProgress: Boolean = false,
+    val currentName: String? = null,
     val message: String
-)
+) {
+    val fraction: Float
+        get() = if (total <= 0) 0f else (processed.toFloat() / total.toFloat()).coerceIn(0f, 1f)
+}
 
 /** A user-selected file, optionally with a folder-relative path for tree sync. */
 data class SelectedItem(
@@ -1264,6 +1330,70 @@ fun ConflictDialogScreen(fileInfo: FileInfo, viewModel: SyncViewModel) {
 }
 
 @Composable
+fun DeleteProgressCard(status: DeleteStatus) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(8.dp)
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    if (status.inProgress) "Deleting from device…" else "Delete result",
+                    fontWeight = FontWeight.SemiBold
+                )
+                if (status.total > 0) {
+                    Text(
+                        "${status.processed} / ${status.total}",
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            }
+
+            if (status.total > 0) {
+                Spacer(modifier = Modifier.height(10.dp))
+                LinearProgressIndicator(
+                    progress = { status.fraction },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(10.dp)
+                )
+                Spacer(modifier = Modifier.height(6.dp))
+                Text(
+                    "Deleted ${status.deleted} · Failed ${status.failed}",
+                    fontSize = 12.sp,
+                    color = Color.Gray
+                )
+            }
+
+            status.currentName?.takeIf { status.inProgress && it.isNotBlank() }?.let { name ->
+                Spacer(modifier = Modifier.height(6.dp))
+                Text(
+                    name,
+                    fontSize = 12.sp,
+                    color = Color.Gray,
+                    maxLines = 1
+                )
+            }
+
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(
+                status.message,
+                color = when {
+                    status.inProgress -> Color(0xFF1565C0)
+                    status.deleted > 0 && status.failed == 0 -> Color(0xFF2E7D32)
+                    status.failed > 0 -> Color(0xFFE65100)
+                    else -> Color.Gray
+                }
+            )
+        }
+    }
+}
+
+@Composable
 fun CompleteScreen(progress: Map<String, UploadProgress>, viewModel: SyncViewModel) {
     val completed = progress.count { it.value.status == UploadStatus.COMPLETED }
     val failed = progress.count { it.value.status == UploadStatus.FAILED }
@@ -1357,19 +1487,13 @@ fun CompleteScreen(progress: Map<String, UploadProgress>, viewModel: SyncViewMod
         }
 
         deleteStatus?.let { status ->
-            Spacer(modifier = Modifier.height(12.dp))
-            Text(
-                status.message,
-                color = when {
-                    status.deleted > 0 && status.failed == 0 -> Color(0xFF2E7D32)
-                    status.failed > 0 -> Color(0xFFE65100)
-                    else -> Color.Gray
-                },
-                modifier = Modifier.padding(horizontal = 8.dp)
-            )
+            Spacer(modifier = Modifier.height(16.dp))
+            DeleteProgressCard(status)
         }
 
         Spacer(modifier = Modifier.height(24.dp))
+
+        val deleting = deleteStatus?.inProgress == true
 
         if (deletableUris.isNotEmpty() && !showDeletePrompt && deleteStatus == null) {
             Button(
@@ -1393,6 +1517,7 @@ fun CompleteScreen(progress: Map<String, UploadProgress>, viewModel: SyncViewMod
 
         Button(
             onClick = { viewModel.continueSyncing() },
+            enabled = !deleting,
             modifier = Modifier.fillMaxWidth()
         ) {
             Text("Sync More Files")
