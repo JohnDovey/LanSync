@@ -2,7 +2,9 @@ package com.lansync.ui
 
 import android.content.Context
 import android.net.Uri
-import android.provider.MediaStore
+import android.provider.OpenableColumns
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.*
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -30,7 +32,6 @@ import com.lansync.network.SyncClient
 import kotlin.coroutines.resume
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
-import java.io.File
 import java.security.MessageDigest
 
 // ============================================================================
@@ -47,6 +48,9 @@ class SyncViewModel(private val context: Context) : ViewModel() {
     private val _syncHistory = mutableStateOf<List<String>>(emptyList())
     val syncHistory: State<List<String>> = _syncHistory
 
+    private val _historyVisible = mutableStateOf(false)
+    val historyVisible: State<Boolean> = _historyVisible
+
     private var syncClient: SyncClient? = null
     private var uploadManager: UploadManager? = null
 
@@ -56,6 +60,7 @@ class SyncViewModel(private val context: Context) : ViewModel() {
     fun initializeSync(serverConfig: ServerConfig) {
         viewModelScope.launch {
             _uiState.value = UiState.Connecting
+            syncClient?.close()
             syncClient = SyncClient(serverConfig)
 
             val result = syncClient?.connect()
@@ -66,21 +71,28 @@ class SyncViewModel(private val context: Context) : ViewModel() {
                 }
                 _uiState.value = UiState.Ready
             } else {
-                _uiState.value = UiState.Error(result?.exceptionOrNull()?.message ?: "Connection failed")
+                val message = result?.exceptionOrNull()?.message ?: "Connection failed"
+                _uiState.value = UiState.Error(message)
             }
         }
     }
 
     fun startSync(selectedFiles: List<Uri>) {
+        if (selectedFiles.isEmpty()) return
+        if (uploadManager == null) {
+            _uiState.value = UiState.Error("Not connected to server")
+            return
+        }
+
         viewModelScope.launch {
             _uiState.value = UiState.Syncing
             _uploadProgress.value = emptyMap()
 
             try {
                 val filesToUpload = selectedFiles.map { uri ->
-                    val fileInfo = getFileInfoFromUri(uri)
-                    val fileData = context.contentResolver.openInputStream(uri)?.readBytes()
-                        ?: throw Exception("Cannot read file")
+                    val fileData = context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                        ?: throw Exception("Cannot read file: ${displayName(uri)}")
+                    val fileInfo = buildFileInfo(uri, fileData)
                     Pair(fileInfo, fileData)
                 }
 
@@ -120,25 +132,36 @@ class SyncViewModel(private val context: Context) : ViewModel() {
         }
     }
 
-    private fun getFileInfoFromUri(uri: Uri): FileInfo {
-        val filename = uri.lastPathSegment ?: "file"
-        val fileData = context.contentResolver.openInputStream(uri)?.readBytes() ?: ByteArray(0)
-        val fileHash = calculateHash(fileData)
-        
+    fun displayName(uri: Uri): String {
+        context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+            ?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                    if (index >= 0) {
+                        val name = cursor.getString(index)
+                        if (!name.isNullOrBlank()) return name
+                    }
+                }
+            }
+        return uri.lastPathSegment?.substringAfterLast('/') ?: "file"
+    }
+
+    private fun buildFileInfo(uri: Uri, fileData: ByteArray): FileInfo {
+        val filename = displayName(uri)
+        val mimeType = context.contentResolver.getType(uri).orEmpty()
         val fileType = when {
-            uri.toString().contains("/images/") -> "photos"
-            uri.toString().contains("/video/") -> "videos"
+            mimeType.startsWith("image/") || mimeType.startsWith("video/") -> "photos"
             else -> "documents"
         }
 
         return FileInfo(
             filename = filename,
-            fileHash = fileHash,
+            fileHash = calculateHash(fileData),
             fileType = fileType,
-            directory = uri.toString(),
+            directory = fileType,
             filePath = uri.toString(),
             fileSize = fileData.size.toLong(),
-            mimeType = context.contentResolver.getType(uri) ?: ""
+            mimeType = mimeType
         )
     }
 
@@ -154,8 +177,37 @@ class SyncViewModel(private val context: Context) : ViewModel() {
             val result = syncClient?.getSyncHistory()
             if (result?.isSuccess == true) {
                 _syncHistory.value = result.getOrNull() ?: emptyList()
+                _historyVisible.value = true
+            } else {
+                _syncHistory.value = emptyList()
+                _historyVisible.value = true
             }
         }
+    }
+
+    fun hideHistory() {
+        _historyVisible.value = false
+    }
+
+    /** Return to file picker after a successful sync (keep connection). */
+    fun continueSyncing() {
+        _uploadProgress.value = emptyMap()
+        _historyVisible.value = false
+        _uiState.value = UiState.Ready
+    }
+
+    /** Disconnect and return to connect form (errors / full restart). */
+    fun resetToConnect() {
+        uploadManager?.cancel()
+        uploadManager = null
+        syncClient?.close()
+        syncClient = null
+        pendingConflictFile = null
+        pendingConflictCallback = null
+        _uploadProgress.value = emptyMap()
+        _syncHistory.value = emptyList()
+        _historyVisible.value = false
+        _uiState.value = UiState.Idle
     }
 
     override fun onCleared() {
@@ -286,6 +338,27 @@ fun ConnectScreen(viewModel: SyncViewModel) {
 fun FilePickerScreen(viewModel: SyncViewModel) {
     var selectedFiles by remember { mutableStateOf<List<Uri>>(emptyList()) }
 
+    fun addUris(uris: List<Uri>) {
+        if (uris.isEmpty()) return
+        selectedFiles = (selectedFiles + uris).distinct()
+    }
+
+    val pickImages = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.GetMultipleContents()
+    ) { uris -> addUris(uris) }
+
+    val pickVideos = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.GetMultipleContents()
+    ) { uris -> addUris(uris) }
+
+    val pickDocuments = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenMultipleDocuments()
+    ) { uris -> addUris(uris) }
+
+    val pickAny = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenMultipleDocuments()
+    ) { uris -> addUris(uris) }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -298,28 +371,35 @@ fun FilePickerScreen(viewModel: SyncViewModel) {
             modifier = Modifier.padding(vertical = 16.dp)
         )
 
-        // Suggested directories
-        SuggestedDirectoriesCard()
+        SuggestedDirectoriesCard(
+            onPhotos = { pickImages.launch("image/*") },
+            onDocuments = { pickDocuments.launch(arrayOf("application/*", "text/*")) },
+            onVideos = { pickVideos.launch("video/*") }
+        )
 
         Spacer(modifier = Modifier.height(24.dp))
 
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .horizontalScroll(rememberScrollState())
+                .horizontalScroll(rememberScrollState()),
+            verticalAlignment = Alignment.CenterVertically
         ) {
-            Button(onClick = { /* Open Photos */ }) {
+            Button(onClick = { pickImages.launch("image/*") }) {
                 Icon(Icons.Default.PhotoLibrary, contentDescription = null)
+                Spacer(modifier = Modifier.width(6.dp))
                 Text("Photos")
             }
             Spacer(modifier = Modifier.width(8.dp))
-            Button(onClick = { /* Open Documents */ }) {
+            Button(onClick = { pickDocuments.launch(arrayOf("application/*", "text/*")) }) {
                 Icon(Icons.Default.Description, contentDescription = null)
+                Spacer(modifier = Modifier.width(6.dp))
                 Text("Documents")
             }
             Spacer(modifier = Modifier.width(8.dp))
-            Button(onClick = { /* Open Custom */ }) {
+            Button(onClick = { pickAny.launch(arrayOf("*/*")) }) {
                 Icon(Icons.Default.Folder, contentDescription = null)
+                Spacer(modifier = Modifier.width(6.dp))
                 Text("Custom")
             }
         }
@@ -327,19 +407,40 @@ fun FilePickerScreen(viewModel: SyncViewModel) {
         Spacer(modifier = Modifier.height(24.dp))
 
         if (selectedFiles.isNotEmpty()) {
-            Text(
-                "Selected Files (${selectedFiles.size})",
-                fontSize = 16.sp,
-                fontWeight = FontWeight.SemiBold
-            )
-            LazyColumn {
-                items(selectedFiles) { uri ->
-                    FileItemCard(uri.lastPathSegment ?: "File")
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    "Selected Files (${selectedFiles.size})",
+                    fontSize = 16.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+                TextButton(onClick = { selectedFiles = emptyList() }) {
+                    Text("Clear")
                 }
             }
+            LazyColumn(modifier = Modifier.weight(1f, fill = false)) {
+                items(selectedFiles, key = { it.toString() }) { uri ->
+                    FileItemCard(
+                        filename = viewModel.displayName(uri),
+                        onRemove = { selectedFiles = selectedFiles.filterNot { it == uri } }
+                    )
+                }
+            }
+        } else {
+            Text(
+                "Tap Photos, Documents, or Custom to choose files.",
+                color = Color.Gray,
+                modifier = Modifier.padding(vertical = 8.dp)
+            )
+            Spacer(modifier = Modifier.weight(1f))
         }
 
-        Spacer(modifier = Modifier.weight(1f))
+        if (selectedFiles.isNotEmpty()) {
+            Spacer(modifier = Modifier.weight(1f))
+        }
 
         Button(
             onClick = { viewModel.startSync(selectedFiles) },
@@ -355,7 +456,11 @@ fun FilePickerScreen(viewModel: SyncViewModel) {
 }
 
 @Composable
-fun SuggestedDirectoriesCard() {
+fun SuggestedDirectoriesCard(
+    onPhotos: () -> Unit,
+    onDocuments: () -> Unit,
+    onVideos: () -> Unit
+) {
     Card(
         modifier = Modifier
             .fillMaxWidth()
@@ -365,16 +470,26 @@ fun SuggestedDirectoriesCard() {
         Column(modifier = Modifier.padding(16.dp)) {
             Text("Quick Access", fontWeight = FontWeight.SemiBold)
             Spacer(modifier = Modifier.height(8.dp))
-            
-            listOf("📷 Photos", "📄 Documents", "🎬 Videos").forEach { path ->
-                Text(path, modifier = Modifier.padding(vertical = 4.dp))
+
+            listOf(
+                "📷 Photos" to onPhotos,
+                "📄 Documents" to onDocuments,
+                "🎬 Videos" to onVideos
+            ).forEach { (label, onClick) ->
+                Text(
+                    label,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable(onClick = onClick)
+                        .padding(vertical = 8.dp)
+                )
             }
         }
     }
 }
 
 @Composable
-fun FileItemCard(filename: String) {
+fun FileItemCard(filename: String, onRemove: (() -> Unit)? = null) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -385,7 +500,12 @@ fun FileItemCard(filename: String) {
     ) {
         Icon(Icons.Default.CheckCircle, contentDescription = null, tint = Color.Green)
         Spacer(modifier = Modifier.width(12.dp))
-        Text(filename)
+        Text(filename, modifier = Modifier.weight(1f))
+        if (onRemove != null) {
+            IconButton(onClick = onRemove) {
+                Icon(Icons.Default.Close, contentDescription = "Remove")
+            }
+        }
     }
 }
 
@@ -483,11 +603,14 @@ fun CompleteScreen(progress: Map<String, UploadProgress>, viewModel: SyncViewMod
     val completed = progress.count { it.value.status == UploadStatus.COMPLETED }
     val failed = progress.count { it.value.status == UploadStatus.FAILED }
     val skipped = progress.count { it.value.status == UploadStatus.SKIPPED }
+    val history by viewModel.syncHistory
+    val historyVisible by viewModel.historyVisible
 
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .padding(16.dp),
+            .padding(16.dp)
+            .verticalScroll(rememberScrollState()),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center
     ) {
@@ -506,8 +629,40 @@ fun CompleteScreen(progress: Map<String, UploadProgress>, viewModel: SyncViewMod
 
         Spacer(modifier = Modifier.height(24.dp))
 
-        Button(onClick = { viewModel.loadSyncHistory() }) {
-            Text("View History")
+        Button(
+            onClick = { viewModel.continueSyncing() },
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text("Sync More Files")
+        }
+
+        Spacer(modifier = Modifier.height(8.dp))
+
+        OutlinedButton(
+            onClick = {
+                if (historyVisible) viewModel.hideHistory() else viewModel.loadSyncHistory()
+            },
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text(if (historyVisible) "Hide History" else "View History")
+        }
+
+        Spacer(modifier = Modifier.height(8.dp))
+
+        TextButton(onClick = { viewModel.resetToConnect() }) {
+            Text("Disconnect")
+        }
+
+        if (historyVisible) {
+            Spacer(modifier = Modifier.height(16.dp))
+            Text("Sync History", fontWeight = FontWeight.SemiBold)
+            if (history.isEmpty()) {
+                Text("No history available", color = Color.Gray, modifier = Modifier.padding(top = 8.dp))
+            } else {
+                history.forEach { entry ->
+                    Text(entry, modifier = Modifier.padding(vertical = 4.dp))
+                }
+            }
         }
     }
 }
@@ -536,7 +691,7 @@ fun ErrorScreen(message: String, viewModel: SyncViewModel) {
         Icon(Icons.Default.Error, contentDescription = null, tint = Color.Red, modifier = Modifier.size(80.dp))
         Text("Error", fontSize = 24.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(vertical = 16.dp))
         Text(message, modifier = Modifier.padding(vertical = 16.dp))
-        Button(onClick = { /* Reset */ }) {
+        Button(onClick = { viewModel.resetToConnect() }) {
             Text("Try Again")
         }
     }

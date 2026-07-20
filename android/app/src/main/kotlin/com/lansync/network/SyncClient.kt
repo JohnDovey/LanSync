@@ -4,6 +4,7 @@ import android.util.Log
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.*
+import java.net.InetSocketAddress
 import java.net.Socket
 import kotlin.math.min
 
@@ -66,9 +67,12 @@ class SyncClient(private val config: ServerConfig) {
 
     suspend fun connect(): Result<Unit> = withContext(Dispatchers.IO) {
         return@withContext try {
-            socket = Socket(config.host, config.port)
-            input = DataInputStream(socket!!.getInputStream())
-            output = DataOutputStream(socket!!.getOutputStream())
+            val sock = Socket()
+            sock.connect(InetSocketAddress(config.host, config.port), CONNECT_TIMEOUT_MS)
+            sock.soTimeout = READ_TIMEOUT_MS
+            socket = sock
+            input = DataInputStream(sock.getInputStream())
+            output = DataOutputStream(sock.getOutputStream())
 
             // Handshake
             handshake()
@@ -78,6 +82,11 @@ class SyncClient(private val config: ServerConfig) {
             close()
             Result.failure(e)
         }
+    }
+
+    companion object {
+        private const val CONNECT_TIMEOUT_MS = 10_000
+        private const val READ_TIMEOUT_MS = 30_000
     }
 
     private suspend fun handshake(): Result<Unit> = withContext(Dispatchers.IO) {
