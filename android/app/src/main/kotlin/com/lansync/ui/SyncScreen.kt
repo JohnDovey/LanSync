@@ -19,6 +19,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.InsertDriveFile
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -430,6 +431,76 @@ class SyncViewModel(private val context: Context) : ViewModel() {
         }
     }
 
+    fun takePersistableTreePermission(treeUri: Uri) {
+        val flags = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+        try {
+            context.contentResolver.takePersistableUriPermission(treeUri, flags)
+        } catch (_: SecurityException) {
+            try {
+                context.contentResolver.takePersistableUriPermission(
+                    treeUri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION
+                )
+            } catch (e: SecurityException) {
+                Log.w(TAG, "Could not take persistable tree permission for $treeUri", e)
+            }
+        }
+    }
+
+    /**
+     * Recursively list file document URIs under a tree URI from [OpenDocumentTree].
+     * Directories are walked; only non-directory documents are returned.
+     */
+    suspend fun listFilesInTree(treeUri: Uri, maxFiles: Int = MAX_FOLDER_FILES): List<Uri> =
+        withContext(Dispatchers.IO) {
+            val result = ArrayList<Uri>()
+            try {
+                walkDocumentTree(
+                    treeUri = treeUri,
+                    documentId = DocumentsContract.getTreeDocumentId(treeUri),
+                    out = result,
+                    maxFiles = maxFiles
+                )
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to list folder $treeUri", e)
+            }
+            result
+        }
+
+    private fun walkDocumentTree(
+        treeUri: Uri,
+        documentId: String,
+        out: MutableList<Uri>,
+        maxFiles: Int
+    ) {
+        if (out.size >= maxFiles) return
+        val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, documentId)
+        val projection = arrayOf(
+            DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+            DocumentsContract.Document.COLUMN_MIME_TYPE
+        )
+        try {
+            context.contentResolver.query(childrenUri, projection, null, null, null)?.use { cursor ->
+                val idIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+                val mimeIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_MIME_TYPE)
+                if (idIdx < 0 || mimeIdx < 0) return
+                while (cursor.moveToNext() && out.size < maxFiles) {
+                    val childId = cursor.getString(idIdx) ?: continue
+                    val mime = cursor.getString(mimeIdx).orEmpty()
+                    if (mime == DocumentsContract.Document.MIME_TYPE_DIR) {
+                        walkDocumentTree(treeUri, childId, out, maxFiles)
+                    } else {
+                        out.add(DocumentsContract.buildDocumentUriUsingTree(treeUri, childId))
+                    }
+                }
+            }
+        } catch (e: SecurityException) {
+            Log.w(TAG, "No access to document children under $documentId", e)
+        } catch (e: Exception) {
+            Log.w(TAG, "Error listing children under $documentId", e)
+        }
+    }
+
     /** Return to file picker after a successful sync (keep connection). */
     fun continueSyncing() {
         clearDeleteState()
@@ -461,6 +532,7 @@ class SyncViewModel(private val context: Context) : ViewModel() {
 
     companion object {
         private const val TAG = "SyncViewModel"
+        const val MAX_FOLDER_FILES = 1000
     }
 }
 
@@ -620,6 +692,9 @@ fun ConnectScreen(viewModel: SyncViewModel) {
 @Composable
 fun FilePickerScreen(viewModel: SyncViewModel) {
     var selectedFiles by remember { mutableStateOf<List<Uri>>(emptyList()) }
+    var isScanningFolder by remember { mutableStateOf(false) }
+    var statusMessage by remember { mutableStateOf<String?>(null) }
+    val scope = rememberCoroutineScope()
 
     fun addUris(uris: List<Uri>) {
         if (uris.isEmpty()) return
@@ -629,19 +704,59 @@ fun FilePickerScreen(viewModel: SyncViewModel) {
 
     val pickImages = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetMultipleContents()
-    ) { uris -> addUris(uris) }
+    ) { uris ->
+        addUris(uris)
+        if (uris.isNotEmpty()) statusMessage = "Added ${uris.size} photo(s)"
+    }
 
     val pickVideos = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetMultipleContents()
-    ) { uris -> addUris(uris) }
+    ) { uris ->
+        addUris(uris)
+        if (uris.isNotEmpty()) statusMessage = "Added ${uris.size} video(s)"
+    }
 
     val pickDocuments = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenMultipleDocuments()
-    ) { uris -> addUris(uris) }
+    ) { uris ->
+        addUris(uris)
+        if (uris.isNotEmpty()) statusMessage = "Added ${uris.size} document(s)"
+    }
 
-    val pickAny = rememberLauncherForActivityResult(
+    // Multi-file pick (any type) — not a folder.
+    val pickAnyFiles = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenMultipleDocuments()
-    ) { uris -> addUris(uris) }
+    ) { uris ->
+        addUris(uris)
+        if (uris.isNotEmpty()) statusMessage = "Added ${uris.size} file(s)"
+    }
+
+    // True folder picker via Storage Access Framework.
+    val pickFolder = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocumentTree()
+    ) { treeUri ->
+        if (treeUri == null) {
+            statusMessage = "Folder selection cancelled"
+            return@rememberLauncherForActivityResult
+        }
+        viewModel.takePersistableTreePermission(treeUri)
+        scope.launch {
+            isScanningFolder = true
+            statusMessage = "Scanning folder…"
+            val files = viewModel.listFilesInTree(treeUri)
+            if (files.isEmpty()) {
+                statusMessage = "No files found in that folder"
+            } else {
+                addUris(files)
+                statusMessage = if (files.size >= SyncViewModel.MAX_FOLDER_FILES) {
+                    "Added first ${files.size} files from folder (limit reached)"
+                } else {
+                    "Added ${files.size} file(s) from folder"
+                }
+            }
+            isScanningFolder = false
+        }
+    }
 
     // Layout: fixed header + Start Sync always visible near the top; only the
     // file list scrolls. Avoids the primary action sitting under gesture nav.
@@ -660,7 +775,7 @@ fun FilePickerScreen(viewModel: SyncViewModel) {
         // Primary action — always on screen, never at the bottom edge.
         Button(
             onClick = { viewModel.startSync(selectedFiles) },
-            enabled = selectedFiles.isNotEmpty(),
+            enabled = selectedFiles.isNotEmpty() && !isScanningFolder,
             modifier = Modifier
                 .fillMaxWidth()
                 .height(56.dp),
@@ -690,28 +805,49 @@ fun FilePickerScreen(viewModel: SyncViewModel) {
                 .horizontalScroll(rememberScrollState()),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Button(onClick = { pickImages.launch("image/*") }) {
+            Button(
+                onClick = { pickImages.launch("image/*") },
+                enabled = !isScanningFolder
+            ) {
                 Icon(Icons.Default.PhotoLibrary, contentDescription = null)
                 Spacer(modifier = Modifier.width(6.dp))
                 Text("Photos")
             }
             Spacer(modifier = Modifier.width(8.dp))
-            Button(onClick = { pickVideos.launch("video/*") }) {
+            Button(
+                onClick = { pickVideos.launch("video/*") },
+                enabled = !isScanningFolder
+            ) {
                 Icon(Icons.Default.Videocam, contentDescription = null)
                 Spacer(modifier = Modifier.width(6.dp))
                 Text("Videos")
             }
             Spacer(modifier = Modifier.width(8.dp))
-            Button(onClick = { pickDocuments.launch(arrayOf("application/*", "text/*")) }) {
+            Button(
+                onClick = { pickDocuments.launch(arrayOf("application/*", "text/*")) },
+                enabled = !isScanningFolder
+            ) {
                 Icon(Icons.Default.Description, contentDescription = null)
                 Spacer(modifier = Modifier.width(6.dp))
                 Text("Documents")
             }
             Spacer(modifier = Modifier.width(8.dp))
-            Button(onClick = { pickAny.launch(arrayOf("*/*")) }) {
+            Button(
+                onClick = { pickFolder.launch(null) },
+                enabled = !isScanningFolder
+            ) {
                 Icon(Icons.Default.Folder, contentDescription = null)
                 Spacer(modifier = Modifier.width(6.dp))
-                Text("Custom")
+                Text("Folder")
+            }
+            Spacer(modifier = Modifier.width(8.dp))
+            Button(
+                onClick = { pickAnyFiles.launch(arrayOf("*/*")) },
+                enabled = !isScanningFolder
+            ) {
+                Icon(Icons.AutoMirrored.Filled.InsertDriveFile, contentDescription = null)
+                Spacer(modifier = Modifier.width(6.dp))
+                Text("Files")
             }
         }
 
@@ -720,10 +856,31 @@ fun FilePickerScreen(viewModel: SyncViewModel) {
         SuggestedDirectoriesCard(
             onPhotos = { pickImages.launch("image/*") },
             onDocuments = { pickDocuments.launch(arrayOf("application/*", "text/*")) },
-            onVideos = { pickVideos.launch("video/*") }
+            onVideos = { pickVideos.launch("video/*") },
+            onFolder = { pickFolder.launch(null) }
         )
 
         Spacer(modifier = Modifier.height(12.dp))
+
+        if (isScanningFolder) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.padding(vertical = 8.dp)
+            ) {
+                CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+                Spacer(modifier = Modifier.width(12.dp))
+                Text("Scanning folder…", color = Color.Gray)
+            }
+        }
+
+        statusMessage?.let { msg ->
+            Text(
+                msg,
+                color = Color(0xFF1565C0),
+                fontSize = 13.sp,
+                modifier = Modifier.padding(vertical = 4.dp)
+            )
+        }
 
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -736,19 +893,25 @@ fun FilePickerScreen(viewModel: SyncViewModel) {
                 fontWeight = FontWeight.SemiBold
             )
             if (selectedFiles.isNotEmpty()) {
-                TextButton(onClick = { selectedFiles = emptyList() }) {
+                TextButton(
+                    onClick = {
+                        selectedFiles = emptyList()
+                        statusMessage = null
+                    },
+                    enabled = !isScanningFolder
+                ) {
                     Text("Clear")
                 }
             }
         }
 
-        if (selectedFiles.isEmpty()) {
+        if (selectedFiles.isEmpty() && !isScanningFolder) {
             Text(
-                "Use Photos, Videos, Documents, or Custom to choose files. Start Sync stays at the top.",
+                "Photos / Videos / Documents / Files pick individual files. Folder picks an entire directory.",
                 color = Color.Gray,
                 modifier = Modifier.padding(vertical = 8.dp)
             )
-        } else {
+        } else if (selectedFiles.isNotEmpty()) {
             LazyColumn(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -758,7 +921,9 @@ fun FilePickerScreen(viewModel: SyncViewModel) {
                 items(selectedFiles, key = { it.toString() }) { uri ->
                     FileItemCard(
                         filename = viewModel.displayName(uri),
-                        onRemove = { selectedFiles = selectedFiles.filterNot { it == uri } }
+                        onRemove = {
+                            selectedFiles = selectedFiles.filterNot { it == uri }
+                        }
                     )
                 }
             }
@@ -770,7 +935,8 @@ fun FilePickerScreen(viewModel: SyncViewModel) {
 fun SuggestedDirectoriesCard(
     onPhotos: () -> Unit,
     onDocuments: () -> Unit,
-    onVideos: () -> Unit
+    onVideos: () -> Unit,
+    onFolder: () -> Unit = {}
 ) {
     Card(
         modifier = Modifier
@@ -785,7 +951,8 @@ fun SuggestedDirectoriesCard(
             listOf(
                 "📷 Photos" to onPhotos,
                 "📄 Documents" to onDocuments,
-                "🎬 Videos" to onVideos
+                "🎬 Videos" to onVideos,
+                "📁 Folder" to onFolder
             ).forEach { (label, onClick) ->
                 Text(
                     label,
