@@ -243,10 +243,16 @@ func (s *Server) recordHistory(userID, deviceID, fileID int64, action, status, m
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// file_id is optional; 0 means NULL so SQLite FK checks pass with foreign_keys=ON.
+	var fileIDArg interface{}
+	if fileID > 0 {
+		fileIDArg = fileID
+	}
+
 	_, err := s.db.Exec(`
 		INSERT INTO sync_history (user_id, device_id, file_id, action, status, message)
 		VALUES (?, ?, ?, ?, ?, ?)
-	`, userID, deviceID, fileID, action, status, message)
+	`, userID, deviceID, fileIDArg, action, status, message)
 	return err
 }
 
@@ -287,10 +293,76 @@ func (s *Server) getStoragePath(userID, deviceID int64, fileType, filename strin
 	// users/{userID}/device{deviceID}/{fileType}/filename
 	return filepath.Join(
 		s.config.StoragePath,
-		fmt.Sprintf("users/%d/device%d/%s", userID, deviceID, fileType),
-		filename,
+		fmt.Sprintf("users/%d/device%d/%s", userID, deviceID, sanitizePathComponent(fileType)),
+		sanitizeFilename(filename),
 	)
 }
+
+// sanitizeFilename strips directories and characters that are illegal on
+// Windows (and awkward on other OSes). Prevents path traversal and Create failures.
+func sanitizeFilename(name string) string {
+	name = filepath.Base(strings.ReplaceAll(name, "\\", "/"))
+	if name == "." || name == ".." || name == "" {
+		return "file"
+	}
+	var b strings.Builder
+	b.Grow(len(name))
+	for _, r := range name {
+		switch {
+		case r < 0x20:
+			b.WriteByte('_')
+		case strings.ContainsRune(`<>:"/\|?*`, r):
+			b.WriteByte('_')
+		default:
+			b.WriteRune(r)
+		}
+	}
+	out := strings.TrimRight(strings.TrimSpace(b.String()), ". ")
+	if out == "" {
+		return "file"
+	}
+	// Windows reserved device names
+	stem := out
+	if i := strings.LastIndex(out, "."); i > 0 {
+		stem = out[:i]
+	}
+	switch strings.ToUpper(stem) {
+	case "CON", "PRN", "AUX", "NUL",
+		"COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+		"LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9":
+		out = "_" + out
+	}
+	if len(out) > 200 {
+		out = out[:200]
+	}
+	return out
+}
+
+func sanitizePathComponent(name string) string {
+	name = sanitizeFilename(name)
+	if name == "file" && name != "" {
+		// keep
+	}
+	return name
+}
+
+// isBenignDisconnect is true for normal client disconnects that should not
+// be logged as server errors (avoids noisy "broken pipe" spam).
+func isBenignDisconnect(err error) bool {
+	if err == nil || err == io.EOF {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "broken pipe") ||
+		strings.Contains(msg, "connection reset") ||
+		strings.Contains(msg, "forcibly closed") ||
+		strings.Contains(msg, "wsasend") ||
+		strings.Contains(msg, "wsarecv") ||
+		strings.Contains(msg, "use of closed network connection") ||
+		strings.Contains(msg, "connection aborted")
+}
+
+const maxChunkSize = 16 * 1024 * 1024 // 16 MiB hard cap
 
 // ============================================================================
 // BINARY PROTOCOL HANDLER
@@ -378,6 +450,12 @@ func (s *Server) handleClient(conn net.Conn) {
 		conn.Close()
 	}()
 
+	if tc, ok := conn.(*net.TCPConn); ok {
+		_ = tc.SetKeepAlive(true)
+		_ = tc.SetKeepAlivePeriod(30 * time.Second)
+		_ = tc.SetNoDelay(true)
+	}
+
 	reader := bufio.NewReader(conn)
 	writer := bufio.NewWriter(conn)
 
@@ -386,8 +464,7 @@ func (s *Server) handleClient(conn net.Conn) {
 		return
 	}
 	if cmd[0] != CMD_HANDSHAKE {
-		writer.WriteByte(RESP_ERROR)
-		writer.Flush()
+		_ = writeResp(writer, RESP_ERROR)
 		return
 	}
 
@@ -402,22 +479,30 @@ func (s *Server) handleClient(conn net.Conn) {
 
 	userID, err := s.getOrCreateUser(username)
 	if err != nil {
-		writer.WriteByte(RESP_ERROR)
-		writer.Flush()
+		_ = writeResp(writer, RESP_ERROR)
 		return
 	}
 
 	deviceID, err := s.getOrCreateDevice(userID, deviceName)
 	if err != nil {
-		writer.WriteByte(RESP_ERROR)
-		writer.Flush()
+		_ = writeResp(writer, RESP_ERROR)
 		return
 	}
 
-	writer.WriteByte(RESP_OK)
-	writer.Flush()
+	if err := writeResp(writer, RESP_OK); err != nil {
+		return
+	}
 
+	fmt.Printf("Client connected: user=%q device=%q from %s\n", username, deviceName, conn.RemoteAddr())
 	s.commandLoop(conn, reader, writer, userID, deviceID)
+	fmt.Printf("Client disconnected: %s\n", conn.RemoteAddr())
+}
+
+func writeResp(writer *bufio.Writer, code byte) error {
+	if err := writer.WriteByte(code); err != nil {
+		return err
+	}
+	return writer.Flush()
 }
 
 func (s *Server) commandLoop(conn net.Conn, reader *bufio.Reader, writer *bufio.Writer, userID, deviceID int64) {
@@ -425,98 +510,110 @@ func (s *Server) commandLoop(conn net.Conn, reader *bufio.Reader, writer *bufio.
 
 	for {
 		if _, err := io.ReadFull(reader, cmdBuf); err != nil {
-			if err != io.EOF {
-				fmt.Printf("Error reading command: %v\n", err)
+			if !isBenignDisconnect(err) {
+				fmt.Printf("Error reading command from %s: %v\n", conn.RemoteAddr(), err)
 			}
 			return
 		}
 
+		var err error
 		switch cmdBuf[0] {
 		case CMD_CHECK_DUPLICATE:
-			s.handleCheckDuplicate(reader, writer, userID, deviceID)
+			err = s.handleCheckDuplicate(reader, writer, userID, deviceID)
 		case CMD_UPLOAD_START:
-			s.handleUploadStart(conn, reader, writer, userID, deviceID)
+			err = s.handleUploadStart(conn, reader, writer, userID, deviceID)
 		case CMD_UPLOAD_CHUNK:
-			s.handleUploadChunk(conn, reader, writer)
+			err = s.handleUploadChunk(conn, reader, writer)
 		case CMD_UPLOAD_END:
-			s.handleUploadEnd(conn, reader, writer, userID, deviceID)
+			err = s.handleUploadEnd(conn, reader, writer, userID, deviceID)
 		case CMD_DELETE_CONFIRM:
-			s.handleDeleteConfirm(reader, writer)
+			err = s.handleDeleteConfirm(writer)
 		case CMD_SYNC_HISTORY:
-			s.handleSyncHistory(reader, writer, userID, deviceID)
+			err = s.handleSyncHistory(writer, userID, deviceID)
 		default:
-			writer.WriteByte(RESP_ERROR)
-			writer.Flush()
+			// Unknown command — respond and keep going (client may recover).
+			err = writeResp(writer, RESP_ERROR)
+		}
+		if err != nil {
+			if !isBenignDisconnect(err) {
+				fmt.Printf("Protocol error from %s: %v\n", conn.RemoteAddr(), err)
+			}
+			return
 		}
 	}
 }
 
-func (s *Server) handleCheckDuplicate(reader *bufio.Reader, writer *bufio.Writer, userID, deviceID int64) {
+func (s *Server) handleCheckDuplicate(reader *bufio.Reader, writer *bufio.Writer, userID, deviceID int64) error {
 	fileHash, err := readString(reader)
 	if err != nil {
-		return
+		return err
 	}
 	filename, err := readString(reader)
 	if err != nil {
-		return
+		return err
 	}
+	filename = sanitizeFilename(filename)
 	fileSize, err := readUint64(reader)
 	if err != nil {
-		return
+		return err
 	}
 
 	isDuplicate, needsUpdate, err := s.checkDuplicate(userID, deviceID, fileHash, filename, int64(fileSize))
 	if err != nil {
-		writer.WriteByte(RESP_ERROR)
-		writer.Flush()
-		return
+		_ = writeResp(writer, RESP_ERROR)
+		return nil // keep connection; application error already reported
 	}
 
 	switch {
 	case !isDuplicate:
-		writer.WriteByte(RESP_OK)
+		return writeResp(writer, RESP_OK)
 	case needsUpdate:
-		writer.WriteByte(RESP_NEED_UPDATE)
+		return writeResp(writer, RESP_NEED_UPDATE)
 	default:
-		writer.WriteByte(RESP_DUPLICATE)
+		return writeResp(writer, RESP_DUPLICATE)
 	}
-	writer.Flush()
 }
 
-func (s *Server) handleUploadStart(conn net.Conn, reader *bufio.Reader, writer *bufio.Writer, userID, deviceID int64) {
+func (s *Server) handleUploadStart(conn net.Conn, reader *bufio.Reader, writer *bufio.Writer, userID, deviceID int64) error {
+	// Close any previous incomplete session on this connection.
+	if prev := uploads.get(conn); prev != nil {
+		prev.file.Close()
+		os.Remove(prev.filePath)
+		uploads.clear(conn)
+	}
+
 	filename, err := readString(reader)
 	if err != nil {
-		return
+		return err
 	}
+	filename = sanitizeFilename(filename)
 	fileHash, err := readString(reader)
 	if err != nil {
-		return
+		return err
 	}
 	fileType, err := readString(reader)
 	if err != nil {
-		return
+		return err
 	}
 	directory, err := readString(reader)
 	if err != nil {
-		return
+		return err
 	}
 	fileSize, err := readUint64(reader)
 	if err != nil {
-		return
+		return err
 	}
 
 	filePath := s.getStoragePath(userID, deviceID, fileType, filename)
 	if err := os.MkdirAll(filepath.Dir(filePath), 0755); err != nil {
-		writer.WriteByte(RESP_ERROR)
-		writer.Flush()
-		return
+		fmt.Printf("MkdirAll failed for %s: %v\n", filePath, err)
+		return writeResp(writer, RESP_ERROR)
 	}
 
 	f, err := os.Create(filePath)
 	if err != nil {
-		writer.WriteByte(RESP_ERROR)
-		writer.Flush()
-		return
+		fmt.Printf("Create failed for %s: %v\n", filePath, err)
+		return writeResp(writer, RESP_ERROR)
 	}
 
 	uploads.set(conn, &uploadSession{
@@ -531,115 +628,113 @@ func (s *Server) handleUploadStart(conn net.Conn, reader *bufio.Reader, writer *
 		file:      f,
 	})
 
-	writer.WriteByte(RESP_OK)
-	writer.Flush()
+	return writeResp(writer, RESP_OK)
 }
 
-func (s *Server) handleUploadChunk(conn net.Conn, reader *bufio.Reader, writer *bufio.Writer) {
+func (s *Server) handleUploadChunk(conn net.Conn, reader *bufio.Reader, writer *bufio.Writer) error {
 	sizeBuf := make([]byte, 4)
 	if _, err := io.ReadFull(reader, sizeBuf); err != nil {
-		return
+		return err
 	}
 	chunkSize := binary.BigEndian.Uint32(sizeBuf)
+	if chunkSize == 0 || chunkSize > maxChunkSize {
+		// Drain is impossible without knowing true size if corrupt; drop connection.
+		return fmt.Errorf("invalid chunk size %d", chunkSize)
+	}
 
 	chunk := make([]byte, chunkSize)
 	if _, err := io.ReadFull(reader, chunk); err != nil {
-		return
+		return err
 	}
 
 	sess := uploads.get(conn)
 	if sess == nil {
-		writer.WriteByte(RESP_ERROR)
-		writer.Flush()
-		return
+		return writeResp(writer, RESP_ERROR)
 	}
 
 	if _, err := sess.file.Write(chunk); err != nil {
-		writer.WriteByte(RESP_ERROR)
-		writer.Flush()
-		return
+		fmt.Printf("Chunk write failed for %s: %v\n", sess.filename, err)
+		return writeResp(writer, RESP_ERROR)
 	}
 	sess.written += int64(len(chunk))
 
-	writer.WriteByte(RESP_OK)
-	writer.Flush()
+	return writeResp(writer, RESP_OK)
 }
 
-func (s *Server) handleUploadEnd(conn net.Conn, reader *bufio.Reader, writer *bufio.Writer, userID, deviceID int64) {
+func (s *Server) handleUploadEnd(conn net.Conn, reader *bufio.Reader, writer *bufio.Writer, userID, deviceID int64) error {
 	// Metadata is re-sent for verification, per protocol.
 	filename, err := readString(reader)
 	if err != nil {
-		return
+		return err
 	}
+	filename = sanitizeFilename(filename)
 	fileHash, err := readString(reader)
 	if err != nil {
-		return
+		return err
 	}
 	_, err = readString(reader) // file type (already known from UPLOAD_START)
 	if err != nil {
-		return
+		return err
 	}
 	directory, err := readString(reader)
 	if err != nil {
-		return
+		return err
 	}
 
 	sess := uploads.get(conn)
 	if sess == nil || sess.filename != filename {
-		writer.WriteByte(RESP_ERROR)
-		writer.Flush()
-		return
+		return writeResp(writer, RESP_ERROR)
 	}
 	defer uploads.clear(conn)
 
 	if err := sess.file.Close(); err != nil {
-		writer.WriteByte(RESP_ERROR)
-		writer.Flush()
-		s.recordHistory(userID, deviceID, 0, "upload", "failed", err.Error())
-		return
+		_ = s.recordHistory(userID, deviceID, 0, "upload", "failed", err.Error())
+		return writeResp(writer, RESP_ERROR)
 	}
 
 	fileID, err := s.recordSyncFile(userID, deviceID, filename, fileHash, directory, sess.filePath, sess.written)
 	if err != nil {
-		writer.WriteByte(RESP_ERROR)
-		writer.Flush()
-		s.recordHistory(userID, deviceID, 0, "upload", "failed", err.Error())
-		return
+		_ = s.recordHistory(userID, deviceID, 0, "upload", "failed", err.Error())
+		return writeResp(writer, RESP_ERROR)
 	}
 
-	s.recordHistory(userID, deviceID, fileID, "upload", "success", "File uploaded successfully")
+	_ = s.recordHistory(userID, deviceID, fileID, "upload", "success", "File uploaded successfully")
 
-	writer.WriteByte(RESP_OK)
-	writer.Flush()
+	return writeResp(writer, RESP_OK)
 }
 
-func (s *Server) handleDeleteConfirm(reader *bufio.Reader, writer *bufio.Writer) {
-	writer.WriteByte(RESP_OK)
-	writer.Flush()
+func (s *Server) handleDeleteConfirm(writer *bufio.Writer) error {
+	return writeResp(writer, RESP_OK)
 }
 
-func (s *Server) handleSyncHistory(reader *bufio.Reader, writer *bufio.Writer, userID, deviceID int64) {
+func (s *Server) handleSyncHistory(writer *bufio.Writer, userID, deviceID int64) error {
 	history, err := s.getHistory(userID, deviceID, 100)
 	if err != nil {
-		writer.WriteByte(RESP_ERROR)
-		writer.Flush()
-		return
+		return writeResp(writer, RESP_ERROR)
 	}
 
-	writer.WriteByte(RESP_OK)
+	if err := writer.WriteByte(RESP_OK); err != nil {
+		return err
+	}
 
 	countBuf := make([]byte, 4)
 	binary.BigEndian.PutUint32(countBuf, uint32(len(history)))
-	writer.Write(countBuf)
+	if _, err := writer.Write(countBuf); err != nil {
+		return err
+	}
 
 	for _, h := range history {
 		msg := fmt.Sprintf("%s|%s|%s|%s", h.CreatedAt.Format(time.RFC3339), h.Action, h.Status, h.Message)
 		lenBuf := make([]byte, 2)
 		binary.BigEndian.PutUint16(lenBuf, uint16(len(msg)))
-		writer.Write(lenBuf)
-		writer.WriteString(msg)
+		if _, err := writer.Write(lenBuf); err != nil {
+			return err
+		}
+		if _, err := writer.WriteString(msg); err != nil {
+			return err
+		}
 	}
-	writer.Flush()
+	return writer.Flush()
 }
 
 // ============================================================================

@@ -7,8 +7,10 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.DataInputStream
 import java.io.DataOutputStream
+import java.io.IOException
 import java.net.InetSocketAddress
 import java.net.Socket
+import java.net.SocketException
 import kotlin.math.min
 
 // ============================================================================
@@ -65,8 +67,9 @@ sealed class SyncResult {
 /**
  * Single TCP connection to the LanSync server.
  *
- * All protocol I/O is serialized with [ioMutex] — the server keeps one
- * upload session per connection, so concurrent writes corrupt the stream.
+ * All protocol I/O is serialized with [ioMutex]. On any I/O failure the socket
+ * is closed so the next call can [reconnect] cleanly (avoids "Broken pipe" on a
+ * half-dead connection).
  */
 class SyncClient(private val config: ServerConfig) {
     private var socket: Socket? = null
@@ -76,30 +79,82 @@ class SyncClient(private val config: ServerConfig) {
     private val TAG = "SyncClient"
 
     suspend fun connect(): Result<Unit> = withContext(Dispatchers.IO) {
-        ioMutex.withLock {
-            try {
-                closeUnlocked()
-                val sock = Socket()
-                sock.tcpNoDelay = true
-                sock.connect(InetSocketAddress(config.host, config.port), CONNECT_TIMEOUT_MS)
-                sock.soTimeout = READ_TIMEOUT_MS
-                socket = sock
-                input = DataInputStream(sock.getInputStream())
-                output = DataOutputStream(sock.getOutputStream())
+        ioMutex.withLock { connectUnlocked() }
+    }
 
-                handshakeUnlocked().getOrThrow()
-                Result.success(Unit)
-            } catch (e: Exception) {
-                Log.e(TAG, "Connection failed to ${config.host}:${config.port}", e)
-                closeUnlocked()
-                Result.failure(Exception("Connect to ${config.host}:${config.port} failed: ${e.message}", e))
-            }
+    /** Re-open the TCP session + handshake (e.g. after a broken pipe). */
+    suspend fun reconnect(): Result<Unit> = connect()
+
+    private fun connectUnlocked(): Result<Unit> {
+        return try {
+            closeUnlocked()
+            val sock = Socket()
+            sock.tcpNoDelay = true
+            sock.keepAlive = true
+            sock.connect(InetSocketAddress(config.host, config.port), CONNECT_TIMEOUT_MS)
+            sock.soTimeout = READ_TIMEOUT_MS
+            socket = sock
+            input = DataInputStream(sock.getInputStream().buffered())
+            output = DataOutputStream(sock.getOutputStream().buffered())
+
+            handshakeUnlocked().getOrThrow()
+            Log.i(TAG, "Connected to ${config.host}:${config.port}")
+            Result.success(Unit)
+        } catch (e: Exception) {
+            Log.e(TAG, "Connection failed to ${config.host}:${config.port}", e)
+            closeUnlocked()
+            Result.failure(Exception(friendlyError("Connect to ${config.host}:${config.port}", e), e))
         }
     }
 
     companion object {
         private const val CONNECT_TIMEOUT_MS = 10_000
-        private const val READ_TIMEOUT_MS = 60_000
+        private const val READ_TIMEOUT_MS = 120_000
+
+        fun isConnectionError(error: Throwable?): Boolean {
+            var t: Throwable? = error
+            while (t != null) {
+                if (t is SocketException) return true
+                val msg = t.message?.lowercase().orEmpty()
+                if (msg.contains("broken pipe") ||
+                    msg.contains("connection reset") ||
+                    msg.contains("connection abort") ||
+                    msg.contains("software caused connection") ||
+                    msg.contains("socket closed") ||
+                    msg.contains("failed to connect") ||
+                    msg.contains("etimedout") ||
+                    msg.contains("econnreset") ||
+                    msg.contains("enotconn")
+                ) {
+                    return true
+                }
+                t = t.cause
+            }
+            return false
+        }
+
+        fun friendlyError(prefix: String, e: Throwable): String {
+            val raw = e.message ?: e.javaClass.simpleName
+            return if (isConnectionError(e)) {
+                "$prefix failed: connection lost ($raw). Is the server still running?"
+            } else {
+                "$prefix failed: $raw"
+            }
+        }
+
+        /** Strip path components and characters illegal on Windows filesystems. */
+        fun sanitizeFilename(name: String): String {
+            var base = name.substringAfterLast('/').substringAfterLast('\\')
+            base = base.replace(Regex("""[<>:"/\\|?*\u0000-\u001f]"""), "_")
+            base = base.trim().trimEnd('.')
+            if (base.isBlank()) base = "file"
+            // Avoid Windows reserved device names (CON, PRN, AUX, NUL, COM1, LPT1, …)
+            val stem = base.substringBeforeLast('.', base)
+            if (stem.matches(Regex("""(?i)(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])"""))) {
+                base = "_$base"
+            }
+            return base.take(200)
+        }
     }
 
     private fun handshakeUnlocked(): Result<Unit> {
@@ -108,15 +163,8 @@ class SyncClient(private val config: ServerConfig) {
             val inp = input ?: return Result.failure(Exception("Not connected"))
 
             out.writeByte(BinaryProtocol.CMD_HANDSHAKE.toInt() and 0xFF)
-
-            val usernameBytes = config.username.toByteArray(Charsets.UTF_8)
-            out.writeShort(usernameBytes.size)
-            out.write(usernameBytes)
-
-            val deviceBytes = config.deviceName.toByteArray(Charsets.UTF_8)
-            out.writeShort(deviceBytes.size)
-            out.write(deviceBytes)
-
+            writeString(out, config.username)
+            writeString(out, config.deviceName)
             out.flush()
 
             val response = inp.readByte()
@@ -131,43 +179,62 @@ class SyncClient(private val config: ServerConfig) {
         }
     }
 
-    suspend fun checkDuplicate(fileInfo: FileInfo): Result<DuplicateCheckResult> =
+    private fun writeString(out: DataOutputStream, value: String) {
+        val bytes = value.toByteArray(Charsets.UTF_8)
+        require(bytes.size <= 0xFFFF) { "String too long for protocol: ${bytes.size}" }
+        out.writeShort(bytes.size)
+        out.write(bytes)
+    }
+
+    private fun requireStreams(): Pair<DataOutputStream, DataInputStream> {
+        val out = output
+        val inp = input
+        if (out == null || inp == null || !isConnected()) {
+            throw SocketException("Not connected to server")
+        }
+        return out to inp
+    }
+
+    /**
+     * Run a protocol operation under the I/O mutex. On I/O failure the socket
+     * is closed so callers can reconnect instead of writing into a dead pipe.
+     */
+    private suspend fun <T> protocolCall(label: String, block: (DataOutputStream, DataInputStream) -> T): Result<T> =
         withContext(Dispatchers.IO) {
             ioMutex.withLock {
                 try {
-                    val out = output ?: return@withLock Result.failure(Exception("Not connected"))
-                    val inp = input ?: return@withLock Result.failure(Exception("Not connected"))
-
-                    out.writeByte(BinaryProtocol.CMD_CHECK_DUPLICATE.toInt() and 0xFF)
-
-                    val hashBytes = fileInfo.fileHash.toByteArray(Charsets.UTF_8)
-                    out.writeShort(hashBytes.size)
-                    out.write(hashBytes)
-
-                    val filenameBytes = fileInfo.filename.toByteArray(Charsets.UTF_8)
-                    out.writeShort(filenameBytes.size)
-                    out.write(filenameBytes)
-
-                    out.writeLong(fileInfo.fileSize)
-                    out.flush()
-
-                    val response = inp.readByte()
-                    val result = when (response) {
-                        BinaryProtocol.RESP_OK ->
-                            DuplicateCheckResult(isDuplicate = false)
-                        BinaryProtocol.RESP_DUPLICATE ->
-                            DuplicateCheckResult(isDuplicate = true, shouldUpdate = false)
-                        BinaryProtocol.RESP_NEED_UPDATE ->
-                            DuplicateCheckResult(isDuplicate = true, shouldUpdate = true)
-                        BinaryProtocol.RESP_ERROR ->
-                            throw Exception("Server error during duplicate check")
-                        else -> throw Exception("Invalid duplicate-check response: ${response.toUByte()}")
+                    if (!isConnected()) {
+                        connectUnlocked().getOrThrow()
                     }
-                    Result.success(result)
+                    val (out, inp) = requireStreams()
+                    Result.success(block(out, inp))
                 } catch (e: Exception) {
-                    Log.e(TAG, "Duplicate check failed for ${fileInfo.filename}", e)
-                    Result.failure(e)
+                    Log.e(TAG, "$label failed", e)
+                    // Drop the socket — stream is unusable after most I/O errors.
+                    closeUnlocked()
+                    Result.failure(Exception(friendlyError(label, e), e))
                 }
+            }
+        }
+
+    suspend fun checkDuplicate(fileInfo: FileInfo): Result<DuplicateCheckResult> =
+        protocolCall("Duplicate check (${fileInfo.filename})") { out, inp ->
+            out.writeByte(BinaryProtocol.CMD_CHECK_DUPLICATE.toInt() and 0xFF)
+            writeString(out, fileInfo.fileHash)
+            writeString(out, fileInfo.filename)
+            out.writeLong(fileInfo.fileSize)
+            out.flush()
+
+            when (val response = inp.readByte()) {
+                BinaryProtocol.RESP_OK ->
+                    DuplicateCheckResult(isDuplicate = false)
+                BinaryProtocol.RESP_DUPLICATE ->
+                    DuplicateCheckResult(isDuplicate = true, shouldUpdate = false)
+                BinaryProtocol.RESP_NEED_UPDATE ->
+                    DuplicateCheckResult(isDuplicate = true, shouldUpdate = true)
+                BinaryProtocol.RESP_ERROR ->
+                    throw IOException("Server error during duplicate check")
+                else -> throw IOException("Invalid duplicate-check response: ${response.toUByte()}")
             }
         }
 
@@ -176,157 +243,113 @@ class SyncClient(private val config: ServerConfig) {
         fileData: ByteArray,
         onBytesSent: ((Long) -> Unit)? = null
     ): Result<Unit> =
-        withContext(Dispatchers.IO) {
-            ioMutex.withLock {
-                try {
-                    val out = output ?: return@withLock Result.failure(Exception("Not connected"))
-                    val inp = input ?: return@withLock Result.failure(Exception("Not connected"))
+        protocolCall("Upload (${fileInfo.filename})") { out, inp ->
+            // UPLOAD_START
+            out.writeByte(BinaryProtocol.CMD_UPLOAD_START.toInt() and 0xFF)
+            writeString(out, fileInfo.filename)
+            writeString(out, fileInfo.fileHash)
+            writeString(out, fileInfo.fileType)
+            writeString(out, fileInfo.directory)
+            out.writeLong(fileData.size.toLong())
+            out.flush()
 
-                    // UPLOAD_START
-                    out.writeByte(BinaryProtocol.CMD_UPLOAD_START.toInt() and 0xFF)
-
-                    val filenameBytes = fileInfo.filename.toByteArray(Charsets.UTF_8)
-                    out.writeShort(filenameBytes.size)
-                    out.write(filenameBytes)
-
-                    val hashBytes = fileInfo.fileHash.toByteArray(Charsets.UTF_8)
-                    out.writeShort(hashBytes.size)
-                    out.write(hashBytes)
-
-                    val typeBytes = fileInfo.fileType.toByteArray(Charsets.UTF_8)
-                    out.writeShort(typeBytes.size)
-                    out.write(typeBytes)
-
-                    val dirBytes = fileInfo.directory.toByteArray(Charsets.UTF_8)
-                    out.writeShort(dirBytes.size)
-                    out.write(dirBytes)
-
-                    out.writeLong(fileData.size.toLong())
-                    out.flush()
-
-                    var response = inp.readByte()
-                    if (response != BinaryProtocol.RESP_OK) {
-                        throw Exception("Upload start failed (code=${response.toUByte()})")
-                    }
-
-                    // Chunks (empty files skip this loop)
-                    var offset = 0
-                    while (offset < fileData.size) {
-                        val chunkSize = min(BinaryProtocol.CHUNK_SIZE, fileData.size - offset)
-                        out.writeByte(BinaryProtocol.CMD_UPLOAD_CHUNK.toInt() and 0xFF)
-                        out.writeInt(chunkSize)
-                        out.write(fileData, offset, chunkSize)
-                        out.flush()
-
-                        response = inp.readByte()
-                        if (response != BinaryProtocol.RESP_OK) {
-                            throw Exception("Chunk upload failed at offset $offset (code=${response.toUByte()})")
-                        }
-
-                        offset += chunkSize
-                        onBytesSent?.invoke(offset.toLong())
-                    }
-
-                    // UPLOAD_END
-                    out.writeByte(BinaryProtocol.CMD_UPLOAD_END.toInt() and 0xFF)
-
-                    out.writeShort(filenameBytes.size)
-                    out.write(filenameBytes)
-
-                    out.writeShort(hashBytes.size)
-                    out.write(hashBytes)
-
-                    out.writeShort(typeBytes.size)
-                    out.write(typeBytes)
-
-                    out.writeShort(dirBytes.size)
-                    out.write(dirBytes)
-
-                    out.flush()
-
-                    response = inp.readByte()
-                    if (response != BinaryProtocol.RESP_OK) {
-                        Result.failure(Exception("Upload end failed (code=${response.toUByte()})"))
-                    } else {
-                        onBytesSent?.invoke(fileData.size.toLong())
-                        Result.success(Unit)
-                    }
-                } catch (e: Exception) {
-                    Log.e(TAG, "Upload failed for ${fileInfo.filename}", e)
-                    Result.failure(e)
-                }
+            var response = inp.readByte()
+            if (response != BinaryProtocol.RESP_OK) {
+                throw IOException("Upload start rejected (code=${response.toUByte()})")
             }
-        }
 
-    suspend fun confirmDelete(): Result<Unit> = withContext(Dispatchers.IO) {
-        ioMutex.withLock {
-            try {
-                val out = output ?: return@withLock Result.failure(Exception("Not connected"))
-                val inp = input ?: return@withLock Result.failure(Exception("Not connected"))
-
-                out.writeByte(BinaryProtocol.CMD_DELETE_CONFIRM.toInt() and 0xFF)
+            var offset = 0
+            while (offset < fileData.size) {
+                val chunkSize = min(BinaryProtocol.CHUNK_SIZE, fileData.size - offset)
+                out.writeByte(BinaryProtocol.CMD_UPLOAD_CHUNK.toInt() and 0xFF)
+                out.writeInt(chunkSize)
+                out.write(fileData, offset, chunkSize)
                 out.flush()
 
-                val response = inp.readByte()
-                if (response == BinaryProtocol.RESP_OK) {
-                    Result.success(Unit)
-                } else {
-                    Result.failure(Exception("Delete confirm failed (code=${response.toUByte()})"))
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "Delete confirm error", e)
-                Result.failure(e)
-            }
-        }
-    }
-
-    suspend fun getSyncHistory(): Result<List<String>> = withContext(Dispatchers.IO) {
-        ioMutex.withLock {
-            try {
-                val out = output ?: return@withLock Result.failure(Exception("Not connected"))
-                val inp = input ?: return@withLock Result.failure(Exception("Not connected"))
-
-                out.writeByte(BinaryProtocol.CMD_SYNC_HISTORY.toInt() and 0xFF)
-                out.flush()
-
-                val response = inp.readByte()
+                response = inp.readByte()
                 if (response != BinaryProtocol.RESP_OK) {
-                    return@withLock Result.failure(Exception("History request failed (code=${response.toUByte()})"))
+                    throw IOException("Chunk rejected at offset $offset (code=${response.toUByte()})")
                 }
 
-                val count = inp.readInt()
-                if (count < 0 || count > 10_000) {
-                    return@withLock Result.failure(Exception("Invalid history count: $count"))
-                }
+                offset += chunkSize
+                onBytesSent?.invoke(offset.toLong())
+            }
 
-                val history = mutableListOf<String>()
-                repeat(count) {
-                    val len = inp.readUnsignedShort()
-                    if (len > 0) {
-                        val bytes = ByteArray(len)
-                        inp.readFully(bytes)
-                        history.add(String(bytes, Charsets.UTF_8))
-                    }
-                }
+            // UPLOAD_END
+            out.writeByte(BinaryProtocol.CMD_UPLOAD_END.toInt() and 0xFF)
+            writeString(out, fileInfo.filename)
+            writeString(out, fileInfo.fileHash)
+            writeString(out, fileInfo.fileType)
+            writeString(out, fileInfo.directory)
+            out.flush()
 
-                Result.success(history)
-            } catch (e: Exception) {
-                Log.e(TAG, "Get history failed", e)
-                Result.failure(e)
+            response = inp.readByte()
+            if (response != BinaryProtocol.RESP_OK) {
+                throw IOException("Upload end rejected (code=${response.toUByte()})")
+            }
+            onBytesSent?.invoke(fileData.size.toLong())
+        }
+
+    suspend fun confirmDelete(): Result<Unit> =
+        protocolCall("Delete confirm") { out, inp ->
+            out.writeByte(BinaryProtocol.CMD_DELETE_CONFIRM.toInt() and 0xFF)
+            out.flush()
+            val response = inp.readByte()
+            if (response != BinaryProtocol.RESP_OK) {
+                throw IOException("Delete confirm rejected (code=${response.toUByte()})")
             }
         }
-    }
+
+    suspend fun getSyncHistory(): Result<List<String>> =
+        protocolCall("Sync history") { out, inp ->
+            out.writeByte(BinaryProtocol.CMD_SYNC_HISTORY.toInt() and 0xFF)
+            out.flush()
+
+            val response = inp.readByte()
+            if (response != BinaryProtocol.RESP_OK) {
+                throw IOException("History request rejected (code=${response.toUByte()})")
+            }
+
+            val count = inp.readInt()
+            if (count < 0 || count > 10_000) {
+                throw IOException("Invalid history count: $count")
+            }
+
+            val history = ArrayList<String>(count)
+            repeat(count) {
+                val len = inp.readUnsignedShort()
+                if (len > 0) {
+                    val bytes = ByteArray(len)
+                    inp.readFully(bytes)
+                    history.add(String(bytes, Charsets.UTF_8))
+                }
+            }
+            history
+        }
 
     fun close() {
-        // Best-effort close; callers typically already hold no lock or are done.
         try {
-            closeUnlocked()
+            // Try to take the lock quickly; if busy, still force-close the socket.
+            if (ioMutex.tryLock()) {
+                try {
+                    closeUnlocked()
+                } finally {
+                    ioMutex.unlock()
+                }
+            } else {
+                closeUnlocked()
+            }
         } catch (e: Exception) {
             Log.e(TAG, "Error closing connection", e)
+            closeUnlocked()
         }
     }
 
     private fun closeUnlocked() {
+        try {
+            socket?.shutdownOutput()
+        } catch (_: Exception) {
+        }
         try {
             socket?.close()
         } catch (_: Exception) {
@@ -344,5 +367,8 @@ class SyncClient(private val config: ServerConfig) {
         output = null
     }
 
-    fun isConnected(): Boolean = socket?.isConnected == true && socket?.isClosed == false
+    fun isConnected(): Boolean {
+        val sock = socket ?: return false
+        return sock.isConnected && !sock.isClosed && !sock.isInputShutdown
+    }
 }

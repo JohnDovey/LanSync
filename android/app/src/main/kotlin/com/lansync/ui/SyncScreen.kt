@@ -215,7 +215,7 @@ class SyncViewModel(private val context: Context) : ViewModel() {
     }
 
     private fun buildFileInfo(uri: Uri, fileData: ByteArray): FileInfo {
-        val filename = displayName(uri)
+        val filename = SyncClient.sanitizeFilename(displayName(uri))
         val mimeType = context.contentResolver.getType(uri).orEmpty()
         val fileType = when {
             mimeType.startsWith("image/") || mimeType.startsWith("video/") -> "photos"

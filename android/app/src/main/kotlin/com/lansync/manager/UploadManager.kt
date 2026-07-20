@@ -27,10 +27,8 @@ data class ConflictResolution(
 )
 
 /**
- * Uploads files over a single [SyncClient] connection.
- *
- * Uploads run **sequentially** — the protocol supports one session per TCP
- * connection, and the client mutex already serializes I/O.
+ * Uploads files over a single [SyncClient] connection, one at a time.
+ * After a connection error the client is reconnected so later files can still sync.
  */
 class UploadManager(
     private val syncClient: SyncClient,
@@ -54,7 +52,6 @@ class UploadManager(
         globalConflictResolution = null
         uploadProgress.clear()
 
-        // Seed progress so the UI shows every file immediately.
         files.forEach { (fileInfo, fileData) ->
             val key = progressKey(fileInfo)
             uploadProgress[key] = UploadProgress(
@@ -87,22 +84,25 @@ class UploadManager(
         try {
             updateProgress(key, fileInfo, UploadStatus.UPLOADING, currentBytes = 0, totalBytes = fileData.size.toLong())
 
-            val dupResult = syncClient.checkDuplicate(fileInfo)
+            // One automatic reconnect+retry if the pipe dies mid-transfer.
+            var dupResult = syncClient.checkDuplicate(fileInfo)
+            if (dupResult.isFailure && SyncClient.isConnectionError(dupResult.exceptionOrNull())) {
+                Log.w(TAG, "Connection lost before duplicate check; reconnecting")
+                val re = syncClient.reconnect()
+                if (re.isFailure) {
+                    fail(key, fileInfo, fileData.size.toLong(), re.exceptionOrNull()?.message)
+                    return
+                }
+                dupResult = syncClient.checkDuplicate(fileInfo)
+            }
             if (dupResult.isFailure) {
-                updateProgress(
-                    key,
-                    fileInfo,
-                    UploadStatus.FAILED,
-                    totalBytes = fileData.size.toLong(),
-                    error = dupResult.exceptionOrNull()?.message ?: "Duplicate check failed"
-                )
+                fail(key, fileInfo, fileData.size.toLong(), dupResult.exceptionOrNull()?.message)
                 return
             }
 
             val dup = dupResult.getOrNull() ?: return
 
             if (dup.isDuplicate && !dup.shouldUpdate) {
-                // Identical file already on server — skip (or override if user chose apply-to-all).
                 val global = globalConflictResolution
                 val resolution = when {
                     global != null -> global
@@ -123,7 +123,7 @@ class UploadManager(
                 }
             }
 
-            val uploadResult = syncClient.uploadFile(fileInfo, fileData) { sent ->
+            var uploadResult = syncClient.uploadFile(fileInfo, fileData) { sent ->
                 updateProgress(
                     key,
                     fileInfo,
@@ -131,6 +131,24 @@ class UploadManager(
                     currentBytes = sent,
                     totalBytes = fileData.size.toLong()
                 )
+            }
+            if (uploadResult.isFailure && SyncClient.isConnectionError(uploadResult.exceptionOrNull())) {
+                Log.w(TAG, "Connection lost during upload of ${fileInfo.filename}; reconnecting and retrying once")
+                val re = syncClient.reconnect()
+                if (re.isSuccess) {
+                    uploadResult = syncClient.uploadFile(fileInfo, fileData) { sent ->
+                        updateProgress(
+                            key,
+                            fileInfo,
+                            UploadStatus.UPLOADING,
+                            currentBytes = sent,
+                            totalBytes = fileData.size.toLong()
+                        )
+                    }
+                } else {
+                    fail(key, fileInfo, fileData.size.toLong(), re.exceptionOrNull()?.message)
+                    return
+                }
             }
 
             if (uploadResult.isSuccess) {
@@ -143,24 +161,30 @@ class UploadManager(
                 )
                 Log.i(TAG, "Successfully uploaded ${fileInfo.filename}")
             } else {
-                updateProgress(
+                fail(
                     key,
                     fileInfo,
-                    UploadStatus.FAILED,
-                    totalBytes = fileData.size.toLong(),
-                    error = uploadResult.exceptionOrNull()?.message ?: "Upload failed"
+                    fileData.size.toLong(),
+                    uploadResult.exceptionOrNull()?.message ?: "Upload failed"
                 )
             }
         } catch (e: Exception) {
             Log.e(TAG, "Upload error for ${fileInfo.filename}", e)
-            updateProgress(
-                key,
-                fileInfo,
-                UploadStatus.FAILED,
-                totalBytes = fileData.size.toLong(),
-                error = e.message ?: "Unknown error"
-            )
+            if (SyncClient.isConnectionError(e)) {
+                runCatching { syncClient.reconnect() }
+            }
+            fail(key, fileInfo, fileData.size.toLong(), e.message)
         }
+    }
+
+    private fun fail(key: String, fileInfo: FileInfo, totalBytes: Long, error: String?) {
+        updateProgress(
+            key,
+            fileInfo,
+            UploadStatus.FAILED,
+            totalBytes = totalBytes,
+            error = error ?: "Unknown error"
+        )
     }
 
     private fun progressKey(fileInfo: FileInfo): String =
@@ -211,7 +235,6 @@ class UploadManager(
     fun getProgress(): Map<String, UploadProgress> = uploadProgress.toMap()
 
     fun cancel() {
-        // Connection close is owned by the ViewModel / SyncClient.
         uploadProgress.clear()
         notifyProgress()
     }
