@@ -1,0 +1,12 @@
+---
+description: Where plans and project documentation live
+globs:
+alwaysApply: true
+---
+
+# Docs directory
+
+All plans and docs for this project go in the `docs/` directory at the project root. When
+writing up a plan, design doc, or decision record, save it under `docs/` (with a descriptive
+filename, e.g. `2026-07-20-sync-protocol-plan.md`) rather than as an ad-hoc file elsewhere or
+only in chat.

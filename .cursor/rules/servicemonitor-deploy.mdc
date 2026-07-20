@@ -1,0 +1,28 @@
+---
+description: LanSync runs as a managed service under the sibling ServiceMonitor project
+globs:
+alwaysApply: true
+---
+
+# Deployment via ServiceMonitor
+
+`/Volumes/JohnDovey/Projects/ServiceMonitor` is a private TUI that starts/stops/monitors
+long-running servers from sibling projects, including this one. Bundled services and their
+manifests live under `ServiceMonitor/services/`.
+
+- Build the binary here, then deploy it into `ServiceMonitor/services/LanSync/` (binary
+  name should match whatever `service.yaml` specifies).
+- Add/maintain `ServiceMonitor/services/LanSync/service.yaml` (committed in that repo)
+  describing this service's processes and endpoints — see other manifests there
+  (WalkieTalkie, QuakeMesh, wShare) for the format. Template tokens available in `args`:
+  `{{root}}`, `{{service}}`, `{{data}}`.
+- Databases/config/identity for this service should live under
+  `ServiceMonitor/services/LanSync/data/` (gitignored there), not inside this repo.
+- Prefer wiring a `scripts/sync-binaries.sh`-compatible build (or adding LanSync to
+  ServiceMonitor's existing sync script) over manual copies, once the build is stable.
+- If this service needs elevated privileges (e.g. raw sockets), set `sudo: true` in the
+  manifest — see MeshSniff's entry in WalkieTalkie's manifest for the pattern (Unix:
+  `sudo -n`; Windows: run ServiceMonitor as Administrator).
+
+Don't invent the manifest/process layout speculatively before this project's actual binary
+name, ports, and data paths are decided — wire this up once those are known.

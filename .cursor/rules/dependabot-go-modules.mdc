@@ -1,0 +1,31 @@
+---
+description: Go module hygiene — Dependabot scans each go.mod independently; go.work does not clear alerts
+globs: "**/go.mod,**/go.sum,go.work,go.work.sum"
+alwaysApply: true
+---
+
+# Go Dependabot / module hygiene
+
+## Lesson from a sibling project (WalkieTalkie, 2026-07)
+
+GitHub Dependabot reported ~22 vulnerabilities on WalkieTalkie's `main` (mostly
+critical/high `golang.org/x/crypto` and moderate `golang.org/x/net`), even though its
+`go.work` workspace build was clean.
+
+**Cause:** `go.work` unified the *build* to patched versions from one module, but a sibling
+module's own `go.mod` still pinned older vulnerable versions. Dependabot scans **each
+`go.mod`/`go.sum` independently** — workspace resolution does not clear alerts.
+
+## Rules (always — applies even with a single go.mod)
+
+1. After any Go dependency change, release prep, or Dependabot complaint: check **every**
+   module with `GOWORK=off`, not only the workspace view.
+2. Bump vulnerable `x/crypto` / `x/net` (and other flagged modules) in **each** `go.mod`,
+   then `go mod tidy` (+ `go work sync` if using a workspace).
+3. Keep the Go `toolchain`/`go` directive on the current patch of the active series —
+   stdlib vulns need point releases.
+4. Verify with `govulncheck ./...` on that toolchain; OSV/GHSA counts on the versions
+   **written in go.mod** are what Dependabot alerts on.
+5. Patch-bump this project's `VERSION` when shipping a security bump, per `versioning.mdc`.
+
+Never assume "builds fine under `go.work`" means Dependabot is clean.

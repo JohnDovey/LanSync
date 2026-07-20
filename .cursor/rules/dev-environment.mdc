@@ -1,0 +1,22 @@
+---
+description: JohnDovey external-drive shell/dev environment (Go toolchain, volume-scoped caches)
+globs:
+alwaysApply: true
+---
+
+# Dev environment
+
+This project lives on the `/Volumes/JohnDovey` external drive. Environment variables are
+set by `/Volumes/JohnDovey/source-john-dovey.sh`, auto-sourced from the shell rc whenever
+the drive is mounted (Android SDK, Xcode, Java, plus AI-agent CLIs homed on the volume —
+not currently needed by this project, but present drive-wide).
+
+- **Go toolchain**: match the version pinned in sibling projects' `go.mod` (WalkieTalkie /
+  ServiceMonitor are on the current 1.26.x patch as of 2026-07) — check `go version` and a
+  sibling `go.mod` rather than assuming a specific patch.
+- If this project later grows an Android/iOS client, WalkieTalkie's
+  `.cursor/rules/dev-environment.mdc` and `android-build.mdc` already solved the
+  SDK/NDK/Xcode/gomobile wiring — duplicate that setup rather than re-deriving it.
+
+Any build or run script added to this project should `source ~/source-john-dovey.sh --quiet`
+at the top rather than hardcoding SDK/toolchain paths. See also `volume-storage.mdc`.

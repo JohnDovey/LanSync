@@ -1,0 +1,16 @@
+---
+description: Version numbering scheme for this project
+globs:
+alwaysApply: true
+---
+
+# Versioning
+
+This project uses **Major.Minor.Patch** versioning (same scheme as sibling projects):
+
+- **Patch** — bug fix or small change
+- **Minor** — new feature, or a major bug fix/change
+- **Major** — releases only
+
+When proposing or applying a version bump, classify the change against these three tiers.
+Do not bump major unless the user is explicitly cutting a release.

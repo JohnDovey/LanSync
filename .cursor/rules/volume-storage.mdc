@@ -1,0 +1,23 @@
+---
+description: Keep files, caches, and tmp/scratch data on /Volumes/JohnDovey rather than the internal disk
+globs:
+alwaysApply: true
+---
+
+# Volume storage
+
+Keep everything for this project on `/Volumes/JohnDovey` as much as possible:
+
+- Use `/Volumes/JohnDovey/tmp` for temporary/scratch files that should persist, not the
+  internal disk's `/tmp`.
+- Go build/module caches should also live on the volume, not the default `~/go` or
+  `~/Library/Caches`.
+- Precedent: sibling projects (ClonesApp, WalkieTalkie) redirect
+  `GOPATH`/`GOCACHE`/`GOMODCACHE`/`TMPDIR` **per-project via env vars in that project's own
+  build/run scripts** (e.g. `/Volumes/JohnDovey/tmp/walkietalkie-gopath`) rather than editing
+  the global `go env` or shell rc. Global `go env` intentionally still points at the default
+  `~/go` — don't change that globally.
+
+Once this project has Go tooling wired up, create a project-scoped cache dir under
+`/Volumes/JohnDovey/tmp/lansync-*` and export `GOPATH`/`GOCACHE`/`GOMODCACHE`/`TMPDIR` for it
+in this project's own scripts (e.g. a `tools/go-env.sh` following WalkieTalkie's pattern).
