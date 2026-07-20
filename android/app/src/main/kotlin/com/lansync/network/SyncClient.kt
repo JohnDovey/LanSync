@@ -2,8 +2,11 @@ package com.lansync.network
 
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
-import java.io.*
+import java.io.DataInputStream
+import java.io.DataOutputStream
 import java.net.InetSocketAddress
 import java.net.Socket
 import kotlin.math.min
@@ -59,58 +62,68 @@ sealed class SyncResult {
     data class Error(val message: String, val exception: Exception? = null) : SyncResult()
 }
 
+/**
+ * Single TCP connection to the LanSync server.
+ *
+ * All protocol I/O is serialized with [ioMutex] — the server keeps one
+ * upload session per connection, so concurrent writes corrupt the stream.
+ */
 class SyncClient(private val config: ServerConfig) {
     private var socket: Socket? = null
     private var input: DataInputStream? = null
     private var output: DataOutputStream? = null
+    private val ioMutex = Mutex()
     private val TAG = "SyncClient"
 
     suspend fun connect(): Result<Unit> = withContext(Dispatchers.IO) {
-        return@withContext try {
-            val sock = Socket()
-            sock.connect(InetSocketAddress(config.host, config.port), CONNECT_TIMEOUT_MS)
-            sock.soTimeout = READ_TIMEOUT_MS
-            socket = sock
-            input = DataInputStream(sock.getInputStream())
-            output = DataOutputStream(sock.getOutputStream())
+        ioMutex.withLock {
+            try {
+                closeUnlocked()
+                val sock = Socket()
+                sock.tcpNoDelay = true
+                sock.connect(InetSocketAddress(config.host, config.port), CONNECT_TIMEOUT_MS)
+                sock.soTimeout = READ_TIMEOUT_MS
+                socket = sock
+                input = DataInputStream(sock.getInputStream())
+                output = DataOutputStream(sock.getOutputStream())
 
-            // Handshake
-            handshake()
-            Result.success(Unit)
-        } catch (e: Exception) {
-            Log.e(TAG, "Connection failed", e)
-            close()
-            Result.failure(e)
+                handshakeUnlocked().getOrThrow()
+                Result.success(Unit)
+            } catch (e: Exception) {
+                Log.e(TAG, "Connection failed to ${config.host}:${config.port}", e)
+                closeUnlocked()
+                Result.failure(Exception("Connect to ${config.host}:${config.port} failed: ${e.message}", e))
+            }
         }
     }
 
     companion object {
         private const val CONNECT_TIMEOUT_MS = 10_000
-        private const val READ_TIMEOUT_MS = 30_000
+        private const val READ_TIMEOUT_MS = 60_000
     }
 
-    private suspend fun handshake(): Result<Unit> = withContext(Dispatchers.IO) {
-        return@withContext try {
-            output?.writeByte(BinaryProtocol.CMD_HANDSHAKE.toInt())
+    private fun handshakeUnlocked(): Result<Unit> {
+        return try {
+            val out = output ?: return Result.failure(Exception("Not connected"))
+            val inp = input ?: return Result.failure(Exception("Not connected"))
 
-            // Send username
-            val usernameBytes = config.username.toByteArray()
-            output?.writeShort(usernameBytes.size)
-            output?.write(usernameBytes)
+            out.writeByte(BinaryProtocol.CMD_HANDSHAKE.toInt() and 0xFF)
 
-            // Send device name
-            val deviceBytes = config.deviceName.toByteArray()
-            output?.writeShort(deviceBytes.size)
-            output?.write(deviceBytes)
+            val usernameBytes = config.username.toByteArray(Charsets.UTF_8)
+            out.writeShort(usernameBytes.size)
+            out.write(usernameBytes)
 
-            output?.flush()
+            val deviceBytes = config.deviceName.toByteArray(Charsets.UTF_8)
+            out.writeShort(deviceBytes.size)
+            out.write(deviceBytes)
 
-            // Read response
-            val response = input?.readByte()
+            out.flush()
+
+            val response = inp.readByte()
             if (response == BinaryProtocol.RESP_OK) {
                 Result.success(Unit)
             } else {
-                Result.failure(Exception("Handshake failed"))
+                Result.failure(Exception("Handshake rejected (code=${response.toUByte()})"))
             }
         } catch (e: Exception) {
             Log.e(TAG, "Handshake error", e)
@@ -120,172 +133,211 @@ class SyncClient(private val config: ServerConfig) {
 
     suspend fun checkDuplicate(fileInfo: FileInfo): Result<DuplicateCheckResult> =
         withContext(Dispatchers.IO) {
-            return@withContext try {
-                output?.writeByte(BinaryProtocol.CMD_CHECK_DUPLICATE.toInt())
+            ioMutex.withLock {
+                try {
+                    val out = output ?: return@withLock Result.failure(Exception("Not connected"))
+                    val inp = input ?: return@withLock Result.failure(Exception("Not connected"))
 
-                // Send file hash
-                val hashBytes = fileInfo.fileHash.toByteArray()
-                output?.writeShort(hashBytes.size)
-                output?.write(hashBytes)
+                    out.writeByte(BinaryProtocol.CMD_CHECK_DUPLICATE.toInt() and 0xFF)
 
-                // Send filename
-                val filenameBytes = fileInfo.filename.toByteArray()
-                output?.writeShort(filenameBytes.size)
-                output?.write(filenameBytes)
+                    val hashBytes = fileInfo.fileHash.toByteArray(Charsets.UTF_8)
+                    out.writeShort(hashBytes.size)
+                    out.write(hashBytes)
 
-                // Send file size
-                output?.writeLong(fileInfo.fileSize)
+                    val filenameBytes = fileInfo.filename.toByteArray(Charsets.UTF_8)
+                    out.writeShort(filenameBytes.size)
+                    out.write(filenameBytes)
 
-                output?.flush()
+                    out.writeLong(fileInfo.fileSize)
+                    out.flush()
 
-                // Read response
-                val response = input?.readByte()
-                val result = when (response) {
-                    BinaryProtocol.RESP_OK ->
-                        DuplicateCheckResult(isDuplicate = false)
-                    BinaryProtocol.RESP_DUPLICATE ->
-                        DuplicateCheckResult(isDuplicate = true, shouldUpdate = false)
-                    BinaryProtocol.RESP_NEED_UPDATE ->
-                        DuplicateCheckResult(isDuplicate = true, shouldUpdate = true)
-                    else -> throw Exception("Invalid response: $response")
+                    val response = inp.readByte()
+                    val result = when (response) {
+                        BinaryProtocol.RESP_OK ->
+                            DuplicateCheckResult(isDuplicate = false)
+                        BinaryProtocol.RESP_DUPLICATE ->
+                            DuplicateCheckResult(isDuplicate = true, shouldUpdate = false)
+                        BinaryProtocol.RESP_NEED_UPDATE ->
+                            DuplicateCheckResult(isDuplicate = true, shouldUpdate = true)
+                        BinaryProtocol.RESP_ERROR ->
+                            throw Exception("Server error during duplicate check")
+                        else -> throw Exception("Invalid duplicate-check response: ${response.toUByte()}")
+                    }
+                    Result.success(result)
+                } catch (e: Exception) {
+                    Log.e(TAG, "Duplicate check failed for ${fileInfo.filename}", e)
+                    Result.failure(e)
                 }
-                Result.success(result)
-            } catch (e: Exception) {
-                Log.e(TAG, "Duplicate check failed", e)
-                Result.failure(e)
             }
         }
 
-    suspend fun uploadFile(fileInfo: FileInfo, fileData: ByteArray): Result<Unit> =
+    suspend fun uploadFile(
+        fileInfo: FileInfo,
+        fileData: ByteArray,
+        onBytesSent: ((Long) -> Unit)? = null
+    ): Result<Unit> =
         withContext(Dispatchers.IO) {
-            return@withContext try {
-                // UPLOAD_START
-                output?.writeByte(BinaryProtocol.CMD_UPLOAD_START.toInt())
+            ioMutex.withLock {
+                try {
+                    val out = output ?: return@withLock Result.failure(Exception("Not connected"))
+                    val inp = input ?: return@withLock Result.failure(Exception("Not connected"))
 
-                val filenameBytes = fileInfo.filename.toByteArray()
-                output?.writeShort(filenameBytes.size)
-                output?.write(filenameBytes)
+                    // UPLOAD_START
+                    out.writeByte(BinaryProtocol.CMD_UPLOAD_START.toInt() and 0xFF)
 
-                val hashBytes = fileInfo.fileHash.toByteArray()
-                output?.writeShort(hashBytes.size)
-                output?.write(hashBytes)
+                    val filenameBytes = fileInfo.filename.toByteArray(Charsets.UTF_8)
+                    out.writeShort(filenameBytes.size)
+                    out.write(filenameBytes)
 
-                val typeBytes = fileInfo.fileType.toByteArray()
-                output?.writeShort(typeBytes.size)
-                output?.write(typeBytes)
+                    val hashBytes = fileInfo.fileHash.toByteArray(Charsets.UTF_8)
+                    out.writeShort(hashBytes.size)
+                    out.write(hashBytes)
 
-                val dirBytes = fileInfo.directory.toByteArray()
-                output?.writeShort(dirBytes.size)
-                output?.write(dirBytes)
+                    val typeBytes = fileInfo.fileType.toByteArray(Charsets.UTF_8)
+                    out.writeShort(typeBytes.size)
+                    out.write(typeBytes)
 
-                output?.writeLong(fileData.size.toLong())
-                output?.flush()
+                    val dirBytes = fileInfo.directory.toByteArray(Charsets.UTF_8)
+                    out.writeShort(dirBytes.size)
+                    out.write(dirBytes)
 
-                // Read OK
-                var response = input?.readByte()
-                if (response != BinaryProtocol.RESP_OK) {
-                    throw Exception("Upload start failed")
-                }
+                    out.writeLong(fileData.size.toLong())
+                    out.flush()
 
-                // Send chunks
-                var offset = 0
-                while (offset < fileData.size) {
-                    val chunkSize = min(BinaryProtocol.CHUNK_SIZE, fileData.size - offset)
-                    output?.writeByte(BinaryProtocol.CMD_UPLOAD_CHUNK.toInt())
-                    output?.writeInt(chunkSize)
-                    output?.write(fileData, offset, chunkSize)
-                    output?.flush()
-
-                    response = input?.readByte()
+                    var response = inp.readByte()
                     if (response != BinaryProtocol.RESP_OK) {
-                        throw Exception("Chunk upload failed at offset $offset")
+                        throw Exception("Upload start failed (code=${response.toUByte()})")
                     }
 
-                    offset += chunkSize
+                    // Chunks (empty files skip this loop)
+                    var offset = 0
+                    while (offset < fileData.size) {
+                        val chunkSize = min(BinaryProtocol.CHUNK_SIZE, fileData.size - offset)
+                        out.writeByte(BinaryProtocol.CMD_UPLOAD_CHUNK.toInt() and 0xFF)
+                        out.writeInt(chunkSize)
+                        out.write(fileData, offset, chunkSize)
+                        out.flush()
+
+                        response = inp.readByte()
+                        if (response != BinaryProtocol.RESP_OK) {
+                            throw Exception("Chunk upload failed at offset $offset (code=${response.toUByte()})")
+                        }
+
+                        offset += chunkSize
+                        onBytesSent?.invoke(offset.toLong())
+                    }
+
+                    // UPLOAD_END
+                    out.writeByte(BinaryProtocol.CMD_UPLOAD_END.toInt() and 0xFF)
+
+                    out.writeShort(filenameBytes.size)
+                    out.write(filenameBytes)
+
+                    out.writeShort(hashBytes.size)
+                    out.write(hashBytes)
+
+                    out.writeShort(typeBytes.size)
+                    out.write(typeBytes)
+
+                    out.writeShort(dirBytes.size)
+                    out.write(dirBytes)
+
+                    out.flush()
+
+                    response = inp.readByte()
+                    if (response != BinaryProtocol.RESP_OK) {
+                        Result.failure(Exception("Upload end failed (code=${response.toUByte()})"))
+                    } else {
+                        onBytesSent?.invoke(fileData.size.toLong())
+                        Result.success(Unit)
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Upload failed for ${fileInfo.filename}", e)
+                    Result.failure(e)
                 }
-
-                // UPLOAD_END
-                output?.writeByte(BinaryProtocol.CMD_UPLOAD_END.toInt())
-
-                output?.writeShort(filenameBytes.size)
-                output?.write(filenameBytes)
-
-                output?.writeShort(hashBytes.size)
-                output?.write(hashBytes)
-
-                output?.writeShort(typeBytes.size)
-                output?.write(typeBytes)
-
-                output?.writeShort(dirBytes.size)
-                output?.write(dirBytes)
-
-                output?.flush()
-
-                response = input?.readByte()
-                if (response != BinaryProtocol.RESP_OK) {
-                    Result.failure(Exception("Upload end failed"))
-                } else {
-                    Result.success(Unit)
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "Upload failed", e)
-                Result.failure(e)
             }
         }
 
     suspend fun confirmDelete(): Result<Unit> = withContext(Dispatchers.IO) {
-        return@withContext try {
-            output?.writeByte(BinaryProtocol.CMD_DELETE_CONFIRM.toInt())
-            output?.flush()
+        ioMutex.withLock {
+            try {
+                val out = output ?: return@withLock Result.failure(Exception("Not connected"))
+                val inp = input ?: return@withLock Result.failure(Exception("Not connected"))
 
-            val response = input?.readByte()
-            if (response == BinaryProtocol.RESP_OK) {
-                Result.success(Unit)
-            } else {
-                Result.failure(Exception("Delete confirm failed"))
+                out.writeByte(BinaryProtocol.CMD_DELETE_CONFIRM.toInt() and 0xFF)
+                out.flush()
+
+                val response = inp.readByte()
+                if (response == BinaryProtocol.RESP_OK) {
+                    Result.success(Unit)
+                } else {
+                    Result.failure(Exception("Delete confirm failed (code=${response.toUByte()})"))
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Delete confirm error", e)
+                Result.failure(e)
             }
-        } catch (e: Exception) {
-            Log.e(TAG, "Delete confirm error", e)
-            Result.failure(e)
         }
     }
 
     suspend fun getSyncHistory(): Result<List<String>> = withContext(Dispatchers.IO) {
-        return@withContext try {
-            output?.writeByte(BinaryProtocol.CMD_SYNC_HISTORY.toInt())
-            output?.flush()
+        ioMutex.withLock {
+            try {
+                val out = output ?: return@withLock Result.failure(Exception("Not connected"))
+                val inp = input ?: return@withLock Result.failure(Exception("Not connected"))
 
-            val response = input?.readByte()
-            if (response != BinaryProtocol.RESP_OK) {
-                return@withContext Result.failure(Exception("History request failed"))
-            }
+                out.writeByte(BinaryProtocol.CMD_SYNC_HISTORY.toInt() and 0xFF)
+                out.flush()
 
-            val count = input?.readInt() ?: 0
-            val history = mutableListOf<String>()
-
-            repeat(count) {
-                val len = input?.readShort()?.toInt() ?: 0
-                if (len > 0) {
-                    val bytes = ByteArray(len)
-                    input?.readFully(bytes)
-                    history.add(String(bytes))
+                val response = inp.readByte()
+                if (response != BinaryProtocol.RESP_OK) {
+                    return@withLock Result.failure(Exception("History request failed (code=${response.toUByte()})"))
                 }
-            }
 
-            Result.success(history)
-        } catch (e: Exception) {
-            Log.e(TAG, "Get history failed", e)
-            Result.failure(e)
+                val count = inp.readInt()
+                if (count < 0 || count > 10_000) {
+                    return@withLock Result.failure(Exception("Invalid history count: $count"))
+                }
+
+                val history = mutableListOf<String>()
+                repeat(count) {
+                    val len = inp.readUnsignedShort()
+                    if (len > 0) {
+                        val bytes = ByteArray(len)
+                        inp.readFully(bytes)
+                        history.add(String(bytes, Charsets.UTF_8))
+                    }
+                }
+
+                Result.success(history)
+            } catch (e: Exception) {
+                Log.e(TAG, "Get history failed", e)
+                Result.failure(e)
+            }
         }
     }
 
     fun close() {
+        // Best-effort close; callers typically already hold no lock or are done.
         try {
-            socket?.close()
-            input?.close()
-            output?.close()
+            closeUnlocked()
         } catch (e: Exception) {
             Log.e(TAG, "Error closing connection", e)
+        }
+    }
+
+    private fun closeUnlocked() {
+        try {
+            socket?.close()
+        } catch (_: Exception) {
+        }
+        try {
+            input?.close()
+        } catch (_: Exception) {
+        }
+        try {
+            output?.close()
+        } catch (_: Exception) {
         }
         socket = null
         input = null

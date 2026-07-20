@@ -1,9 +1,17 @@
 package com.lansync.ui
 
+import android.app.Activity
 import android.content.Context
+import android.content.Intent
+import android.content.IntentSender
 import android.net.Uri
+import android.os.Build
+import android.provider.DocumentsContract
+import android.provider.MediaStore
 import android.provider.OpenableColumns
+import android.util.Log
 import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.*
 import androidx.compose.foundation.layout.*
@@ -22,6 +30,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.lansync.SavedSettings
+import com.lansync.SettingsStore
 import com.lansync.manager.ConflictResolution
 import com.lansync.manager.UploadManager
 import com.lansync.manager.UploadProgress
@@ -30,8 +40,10 @@ import com.lansync.network.FileInfo
 import com.lansync.network.ServerConfig
 import com.lansync.network.SyncClient
 import kotlin.coroutines.resume
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withContext
 import java.security.MessageDigest
 
 // ============================================================================
@@ -39,8 +51,13 @@ import java.security.MessageDigest
 // ============================================================================
 
 class SyncViewModel(private val context: Context) : ViewModel() {
+    private val settingsStore = SettingsStore(context)
+
     private val _uiState = mutableStateOf<UiState>(UiState.Idle)
     val uiState: State<UiState> = _uiState
+
+    private val _savedSettings = mutableStateOf(settingsStore.load())
+    val savedSettings: State<SavedSettings> = _savedSettings
 
     private val _uploadProgress = mutableStateOf<Map<String, UploadProgress>>(emptyMap())
     val uploadProgress: State<Map<String, UploadProgress>> = _uploadProgress
@@ -51,13 +68,42 @@ class SyncViewModel(private val context: Context) : ViewModel() {
     private val _historyVisible = mutableStateOf(false)
     val historyVisible: State<Boolean> = _historyVisible
 
+    /** Successfully uploaded local URIs awaiting optional deletion. */
+    private val _deletableUris = mutableStateOf<List<Uri>>(emptyList())
+    val deletableUris: State<List<Uri>> = _deletableUris
+
+    private val _showDeletePrompt = mutableStateOf(false)
+    val showDeletePrompt: State<Boolean> = _showDeletePrompt
+
+    private val _deleteStatus = mutableStateOf<DeleteStatus?>(null)
+    val deleteStatus: State<DeleteStatus?> = _deleteStatus
+
+    /** When set, the UI should launch the system delete confirmation sheet. */
+    private val _pendingSystemDelete = mutableStateOf<IntentSender?>(null)
+    val pendingSystemDelete: State<IntentSender?> = _pendingSystemDelete
+
+    private var systemDeleteUris: List<Uri> = emptyList()
+    private var directDeletedCount = 0
+    private var directFailedCount = 0
+
     private var syncClient: SyncClient? = null
     private var uploadManager: UploadManager? = null
 
     private var pendingConflictFile: FileInfo? = null
     private var pendingConflictCallback: (suspend (ConflictResolution) -> Unit)? = null
 
+    /** Persist fields as the user types so they survive process death / app restart. */
+    fun saveConnectionFields(host: String, port: String, username: String, deviceName: String) {
+        val portNum = port.toIntOrNull() ?: SettingsStore.DEFAULT_PORT
+        settingsStore.save(host, portNum, username, deviceName)
+        // Do not bump _savedSettings here — that would recompose the form and reset the cursor.
+    }
+
     fun initializeSync(serverConfig: ServerConfig) {
+        // Always persist before connecting so a failed attempt still remembers the address.
+        settingsStore.save(serverConfig)
+        _savedSettings.value = settingsStore.load()
+
         viewModelScope.launch {
             _uiState.value = UiState.Connecting
             syncClient?.close()
@@ -65,7 +111,7 @@ class SyncViewModel(private val context: Context) : ViewModel() {
 
             val result = syncClient?.connect()
             if (result?.isSuccess == true) {
-                uploadManager = UploadManager(syncClient!!, maxConcurrent = 10)
+                uploadManager = UploadManager(syncClient!!, maxConcurrent = 1)
                 uploadManager?.setProgressCallback { progress ->
                     _uploadProgress.value = progress
                 }
@@ -79,7 +125,7 @@ class SyncViewModel(private val context: Context) : ViewModel() {
 
     fun startSync(selectedFiles: List<Uri>) {
         if (selectedFiles.isEmpty()) return
-        if (uploadManager == null) {
+        if (uploadManager == null || syncClient?.isConnected() != true) {
             _uiState.value = UiState.Error("Not connected to server")
             return
         }
@@ -87,25 +133,47 @@ class SyncViewModel(private val context: Context) : ViewModel() {
         viewModelScope.launch {
             _uiState.value = UiState.Syncing
             _uploadProgress.value = emptyMap()
+            clearDeleteState()
 
             try {
-                val filesToUpload = selectedFiles.map { uri ->
+                val prepared = selectedFiles.map { uri ->
                     val fileData = context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
                         ?: throw Exception("Cannot read file: ${displayName(uri)}")
                     val fileInfo = buildFileInfo(uri, fileData)
-                    Pair(fileInfo, fileData)
+                    PreparedUpload(uri, fileInfo, fileData)
                 }
 
-                uploadManager?.uploadFiles(filesToUpload) { fileInfo ->
+                val result = uploadManager?.uploadFiles(
+                    prepared.map { it.fileInfo to it.fileData }
+                ) { fileInfo ->
                     handleConflict(fileInfo)
                 }
 
-                _uiState.value = UiState.Complete
+                if (result?.isFailure == true) {
+                    _uiState.value = UiState.Error(
+                        result.exceptionOrNull()?.message ?: "Sync failed"
+                    )
+                } else {
+                    val progress = uploadManager?.getProgress().orEmpty()
+                    val completedUris = prepared.mapNotNull { item ->
+                        val key = "${item.fileInfo.filename}|${item.fileInfo.fileHash}"
+                        if (progress[key]?.status == UploadStatus.COMPLETED) item.uri else null
+                    }
+                    _deletableUris.value = completedUris
+                    _showDeletePrompt.value = completedUris.isNotEmpty()
+                    _uiState.value = UiState.Complete
+                }
             } catch (e: Exception) {
                 _uiState.value = UiState.Error(e.message ?: "Sync failed")
             }
         }
     }
+
+    private data class PreparedUpload(
+        val uri: Uri,
+        val fileInfo: FileInfo,
+        val fileData: ByteArray
+    )
 
     private suspend fun handleConflict(fileInfo: FileInfo): ConflictResolution? {
         pendingConflictFile = fileInfo
@@ -189,8 +257,179 @@ class SyncViewModel(private val context: Context) : ViewModel() {
         _historyVisible.value = false
     }
 
+    fun declineDeleteLocalFiles() {
+        _showDeletePrompt.value = false
+        _deleteStatus.value = DeleteStatus(
+            deleted = 0,
+            failed = 0,
+            message = "Local files kept on device"
+        )
+        _deletableUris.value = emptyList()
+    }
+
+    /**
+     * User chose to remove successfully synced files from the device.
+     * Some media URIs require a system confirmation sheet (API 30+).
+     */
+    fun confirmDeleteLocalFiles() {
+        val uris = _deletableUris.value
+        if (uris.isEmpty()) {
+            _showDeletePrompt.value = false
+            return
+        }
+
+        viewModelScope.launch {
+            _showDeletePrompt.value = false
+            _deleteStatus.value = DeleteStatus(deleted = 0, failed = 0, message = "Deleting…")
+
+            val directOk = mutableListOf<Uri>()
+            val needConsent = mutableListOf<Uri>()
+            val failed = mutableListOf<Uri>()
+
+            withContext(Dispatchers.IO) {
+                for (uri in uris) {
+                    when (tryDeleteUri(uri)) {
+                        DeleteAttempt.Success -> directOk.add(uri)
+                        DeleteAttempt.NeedsUserConsent -> needConsent.add(uri)
+                        DeleteAttempt.Failed -> failed.add(uri)
+                    }
+                }
+            }
+
+            directDeletedCount = directOk.size
+            directFailedCount = failed.size
+
+            // Notify server that the client chose the post-sync delete path.
+            runCatching { syncClient?.confirmDelete() }
+
+            if (needConsent.isNotEmpty() && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                try {
+                    val request = MediaStore.createDeleteRequest(context.contentResolver, needConsent)
+                    systemDeleteUris = needConsent
+                    _pendingSystemDelete.value = request.intentSender
+                    _deleteStatus.value = DeleteStatus(
+                        deleted = directOk.size,
+                        failed = failed.size,
+                        message = "Confirm deletion in the system dialog…"
+                    )
+                    return@launch
+                } catch (e: Exception) {
+                    Log.e(TAG, "createDeleteRequest failed", e)
+                    directFailedCount += needConsent.size
+                }
+            } else if (needConsent.isNotEmpty()) {
+                directFailedCount += needConsent.size
+            }
+
+            finishDeleteSummary(extraDeleted = 0, extraFailed = 0)
+            _deletableUris.value = emptyList()
+        }
+    }
+
+    fun onSystemDeleteResult(granted: Boolean) {
+        val pending = systemDeleteUris
+        systemDeleteUris = emptyList()
+        _pendingSystemDelete.value = null
+
+        val extraDeleted = if (granted) pending.size else 0
+        val extraFailed = if (granted) 0 else pending.size
+        finishDeleteSummary(extraDeleted, extraFailed)
+        _deletableUris.value = emptyList()
+    }
+
+    fun clearPendingSystemDelete() {
+        _pendingSystemDelete.value = null
+    }
+
+    private fun finishDeleteSummary(extraDeleted: Int, extraFailed: Int) {
+        val deleted = directDeletedCount + extraDeleted
+        val failed = directFailedCount + extraFailed
+        _deleteStatus.value = when {
+            deleted > 0 && failed == 0 ->
+                DeleteStatus(deleted, failed, "Deleted $deleted file(s) from this device")
+            deleted > 0 ->
+                DeleteStatus(deleted, failed, "Deleted $deleted file(s); $failed could not be removed")
+            failed > 0 ->
+                DeleteStatus(deleted, failed, "Could not delete $failed file(s). Android may block removal for some gallery items.")
+            else ->
+                DeleteStatus(0, 0, "No files deleted")
+        }
+        directDeletedCount = 0
+        directFailedCount = 0
+    }
+
+    private fun clearDeleteState() {
+        _deletableUris.value = emptyList()
+        _showDeletePrompt.value = false
+        _deleteStatus.value = null
+        _pendingSystemDelete.value = null
+        systemDeleteUris = emptyList()
+        directDeletedCount = 0
+        directFailedCount = 0
+    }
+
+    private enum class DeleteAttempt { Success, NeedsUserConsent, Failed }
+
+    private fun tryDeleteUri(uri: Uri): DeleteAttempt {
+        val resolver = context.contentResolver
+        try {
+            if (DocumentsContract.isDocumentUri(context, uri)) {
+                if (DocumentsContract.deleteDocument(resolver, uri)) {
+                    return DeleteAttempt.Success
+                }
+            }
+        } catch (e: SecurityException) {
+            Log.w(TAG, "No permission to delete document $uri", e)
+        } catch (e: Exception) {
+            Log.w(TAG, "DocumentsContract delete failed for $uri", e)
+        }
+
+        try {
+            val rows = resolver.delete(uri, null, null)
+            if (rows > 0) return DeleteAttempt.Success
+        } catch (e: SecurityException) {
+            Log.w(TAG, "No permission to delete $uri", e)
+            // MediaStore often requires a user-confirmed bulk delete on API 30+.
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && isMediaStoreUri(uri)) {
+                return DeleteAttempt.NeedsUserConsent
+            }
+            return DeleteAttempt.Failed
+        } catch (e: Exception) {
+            Log.w(TAG, "ContentResolver delete failed for $uri", e)
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && isMediaStoreUri(uri)) {
+            return DeleteAttempt.NeedsUserConsent
+        }
+        return DeleteAttempt.Failed
+    }
+
+    private fun isMediaStoreUri(uri: Uri): Boolean {
+        val authority = uri.authority ?: return false
+        return authority == MediaStore.AUTHORITY || authority.contains("media", ignoreCase = true)
+    }
+
+    fun takePersistablePermissions(uris: List<Uri>) {
+        val flags = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+        for (uri in uris) {
+            try {
+                context.contentResolver.takePersistableUriPermission(uri, flags)
+            } catch (_: SecurityException) {
+                try {
+                    context.contentResolver.takePersistableUriPermission(
+                        uri,
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION
+                    )
+                } catch (_: SecurityException) {
+                    // GetContent URIs often don't support persistable grants.
+                }
+            }
+        }
+    }
+
     /** Return to file picker after a successful sync (keep connection). */
     fun continueSyncing() {
+        clearDeleteState()
         _uploadProgress.value = emptyMap()
         _historyVisible.value = false
         _uiState.value = UiState.Ready
@@ -204,6 +443,7 @@ class SyncViewModel(private val context: Context) : ViewModel() {
         syncClient = null
         pendingConflictFile = null
         pendingConflictCallback = null
+        clearDeleteState()
         _uploadProgress.value = emptyMap()
         _syncHistory.value = emptyList()
         _historyVisible.value = false
@@ -215,7 +455,17 @@ class SyncViewModel(private val context: Context) : ViewModel() {
         uploadManager?.cancel()
         super.onCleared()
     }
+
+    companion object {
+        private const val TAG = "SyncViewModel"
+    }
 }
+
+data class DeleteStatus(
+    val deleted: Int,
+    val failed: Int,
+    val message: String
+)
 
 sealed class UiState {
     object Idle : UiState()
@@ -255,10 +505,16 @@ fun SyncMainScreen(viewModel: SyncViewModel) {
 
 @Composable
 fun ConnectScreen(viewModel: SyncViewModel) {
-    var host by remember { mutableStateOf("192.168.1.100") }
-    var port by remember { mutableStateOf("10101") }
-    var username by remember { mutableStateOf("user1") }
-    var deviceName by remember { mutableStateOf("android-phone") }
+    // Load once when the connect form is first shown (after cold start or Disconnect).
+    val initial = remember { viewModel.savedSettings.value }
+    var host by remember { mutableStateOf(initial.host) }
+    var port by remember { mutableStateOf(initial.port.toString()) }
+    var username by remember { mutableStateOf(initial.username) }
+    var deviceName by remember { mutableStateOf(initial.deviceName) }
+
+    fun persistDraft() {
+        viewModel.saveConnectionFields(host, port, username, deviceName)
+    }
 
     Column(
         modifier = Modifier
@@ -279,8 +535,12 @@ fun ConnectScreen(viewModel: SyncViewModel) {
 
         OutlinedTextField(
             value = host,
-            onValueChange = { host = it },
+            onValueChange = {
+                host = it
+                persistDraft()
+            },
             label = { Text("Server Host") },
+            singleLine = true,
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(vertical = 8.dp),
@@ -289,8 +549,12 @@ fun ConnectScreen(viewModel: SyncViewModel) {
 
         OutlinedTextField(
             value = port,
-            onValueChange = { port = it },
+            onValueChange = {
+                port = it.filter { ch -> ch.isDigit() }.take(5)
+                persistDraft()
+            },
             label = { Text("Server Port") },
+            singleLine = true,
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(vertical = 8.dp),
@@ -299,8 +563,12 @@ fun ConnectScreen(viewModel: SyncViewModel) {
 
         OutlinedTextField(
             value = username,
-            onValueChange = { username = it },
+            onValueChange = {
+                username = it
+                persistDraft()
+            },
             label = { Text("Username") },
+            singleLine = true,
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(vertical = 8.dp),
@@ -309,8 +577,12 @@ fun ConnectScreen(viewModel: SyncViewModel) {
 
         OutlinedTextField(
             value = deviceName,
-            onValueChange = { deviceName = it },
+            onValueChange = {
+                deviceName = it
+                persistDraft()
+            },
             label = { Text("Device Name") },
+            singleLine = true,
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(vertical = 8.dp),
@@ -321,9 +593,15 @@ fun ConnectScreen(viewModel: SyncViewModel) {
 
         Button(
             onClick = {
-                val config = ServerConfig(host, port.toIntOrNull() ?: 10101, username, deviceName)
+                val config = ServerConfig(
+                    host = host.trim(),
+                    port = port.toIntOrNull() ?: SettingsStore.DEFAULT_PORT,
+                    username = username.trim(),
+                    deviceName = deviceName.trim()
+                )
                 viewModel.initializeSync(config)
             },
+            enabled = host.isNotBlank() && username.isNotBlank() && deviceName.isNotBlank(),
             modifier = Modifier
                 .fillMaxWidth()
                 .height(48.dp),
@@ -340,6 +618,7 @@ fun FilePickerScreen(viewModel: SyncViewModel) {
 
     fun addUris(uris: List<Uri>) {
         if (uris.isEmpty()) return
+        viewModel.takePersistablePermissions(uris)
         selectedFiles = (selectedFiles + uris).distinct()
     }
 
@@ -359,98 +638,114 @@ fun FilePickerScreen(viewModel: SyncViewModel) {
         contract = ActivityResultContracts.OpenMultipleDocuments()
     ) { uris -> addUris(uris) }
 
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(16.dp)
-    ) {
-        Text(
-            "Select Files to Sync",
-            fontSize = 24.sp,
-            fontWeight = FontWeight.Bold,
-            modifier = Modifier.padding(vertical = 16.dp)
-        )
-
-        SuggestedDirectoriesCard(
-            onPhotos = { pickImages.launch("image/*") },
-            onDocuments = { pickDocuments.launch(arrayOf("application/*", "text/*")) },
-            onVideos = { pickVideos.launch("video/*") }
-        )
-
-        Spacer(modifier = Modifier.height(24.dp))
-
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .horizontalScroll(rememberScrollState()),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Button(onClick = { pickImages.launch("image/*") }) {
-                Icon(Icons.Default.PhotoLibrary, contentDescription = null)
-                Spacer(modifier = Modifier.width(6.dp))
-                Text("Photos")
-            }
-            Spacer(modifier = Modifier.width(8.dp))
-            Button(onClick = { pickDocuments.launch(arrayOf("application/*", "text/*")) }) {
-                Icon(Icons.Default.Description, contentDescription = null)
-                Spacer(modifier = Modifier.width(6.dp))
-                Text("Documents")
-            }
-            Spacer(modifier = Modifier.width(8.dp))
-            Button(onClick = { pickAny.launch(arrayOf("*/*")) }) {
-                Icon(Icons.Default.Folder, contentDescription = null)
-                Spacer(modifier = Modifier.width(6.dp))
-                Text("Custom")
-            }
-        }
-
-        Spacer(modifier = Modifier.height(24.dp))
-
-        if (selectedFiles.isNotEmpty()) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
+    // Pin Start Sync in the bottom bar so it cannot be scrolled off-screen.
+    Scaffold(
+        containerColor = Color(0xFFF5F5F5),
+        bottomBar = {
+            Surface(
+                tonalElevation = 3.dp,
+                shadowElevation = 8.dp
             ) {
-                Text(
-                    "Selected Files (${selectedFiles.size})",
-                    fontSize = 16.sp,
-                    fontWeight = FontWeight.SemiBold
-                )
-                TextButton(onClick = { selectedFiles = emptyList() }) {
-                    Text("Clear")
-                }
-            }
-            LazyColumn(modifier = Modifier.weight(1f, fill = false)) {
-                items(selectedFiles, key = { it.toString() }) { uri ->
-                    FileItemCard(
-                        filename = viewModel.displayName(uri),
-                        onRemove = { selectedFiles = selectedFiles.filterNot { it == uri } }
+                Button(
+                    onClick = { viewModel.startSync(selectedFiles) },
+                    enabled = selectedFiles.isNotEmpty(),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(16.dp)
+                        .height(52.dp),
+                    shape = RoundedCornerShape(8.dp)
+                ) {
+                    Text(
+                        if (selectedFiles.isEmpty()) "Select files to sync" else "Start Sync (${selectedFiles.size})",
+                        fontSize = 16.sp
                     )
                 }
             }
-        } else {
-            Text(
-                "Tap Photos, Documents, or Custom to choose files.",
-                color = Color.Gray,
-                modifier = Modifier.padding(vertical = 8.dp)
-            )
-            Spacer(modifier = Modifier.weight(1f))
         }
-
-        if (selectedFiles.isNotEmpty()) {
-            Spacer(modifier = Modifier.weight(1f))
-        }
-
-        Button(
-            onClick = { viewModel.startSync(selectedFiles) },
-            enabled = selectedFiles.isNotEmpty(),
+    ) { padding ->
+        Column(
             modifier = Modifier
-                .fillMaxWidth()
-                .height(48.dp),
-            shape = RoundedCornerShape(8.dp)
+                .fillMaxSize()
+                .padding(padding)
+                .padding(horizontal = 16.dp)
         ) {
-            Text("Start Sync", fontSize = 16.sp)
+            Text(
+                "Select Files to Sync",
+                fontSize = 24.sp,
+                fontWeight = FontWeight.Bold,
+                modifier = Modifier.padding(vertical = 16.dp)
+            )
+
+            SuggestedDirectoriesCard(
+                onPhotos = { pickImages.launch("image/*") },
+                onDocuments = { pickDocuments.launch(arrayOf("application/*", "text/*")) },
+                onVideos = { pickVideos.launch("video/*") }
+            )
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState()),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Button(onClick = { pickImages.launch("image/*") }) {
+                    Icon(Icons.Default.PhotoLibrary, contentDescription = null)
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("Photos")
+                }
+                Spacer(modifier = Modifier.width(8.dp))
+                Button(onClick = { pickDocuments.launch(arrayOf("application/*", "text/*")) }) {
+                    Icon(Icons.Default.Description, contentDescription = null)
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("Documents")
+                }
+                Spacer(modifier = Modifier.width(8.dp))
+                Button(onClick = { pickAny.launch(arrayOf("*/*")) }) {
+                    Icon(Icons.Default.Folder, contentDescription = null)
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("Custom")
+                }
+            }
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            if (selectedFiles.isNotEmpty()) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        "Selected Files (${selectedFiles.size})",
+                        fontSize = 16.sp,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    TextButton(onClick = { selectedFiles = emptyList() }) {
+                        Text("Clear")
+                    }
+                }
+                LazyColumn(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .weight(1f),
+                    contentPadding = PaddingValues(bottom = 8.dp)
+                ) {
+                    items(selectedFiles, key = { it.toString() }) { uri ->
+                        FileItemCard(
+                            filename = viewModel.displayName(uri),
+                            onRemove = { selectedFiles = selectedFiles.filterNot { it == uri } }
+                        )
+                    }
+                }
+            } else {
+                Text(
+                    "Tap Photos, Documents, or Custom to choose files.",
+                    color = Color.Gray,
+                    modifier = Modifier.padding(vertical = 8.dp)
+                )
+            }
         }
     }
 }
@@ -511,6 +806,13 @@ fun FileItemCard(filename: String, onRemove: (() -> Unit)? = null) {
 
 @Composable
 fun SyncProgressScreen(progress: Map<String, UploadProgress>) {
+    val items = progress.values.toList()
+    val done = items.count {
+        it.status == UploadStatus.COMPLETED ||
+            it.status == UploadStatus.FAILED ||
+            it.status == UploadStatus.SKIPPED
+    }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -522,9 +824,14 @@ fun SyncProgressScreen(progress: Map<String, UploadProgress>) {
             fontWeight = FontWeight.Bold,
             modifier = Modifier.padding(vertical = 16.dp)
         )
+        Text(
+            if (items.isEmpty()) "Preparing..." else "Progress: $done / ${items.size}",
+            color = Color.Gray,
+            modifier = Modifier.padding(bottom = 12.dp)
+        )
 
         LazyColumn {
-            items(progress.values.toList()) { fileProgress ->
+            items(items, key = { "${it.fileInfo.filename}|${it.fileInfo.fileHash}" }) { fileProgress ->
                 ProgressItemCard(fileProgress)
             }
         }
@@ -605,6 +912,53 @@ fun CompleteScreen(progress: Map<String, UploadProgress>, viewModel: SyncViewMod
     val skipped = progress.count { it.value.status == UploadStatus.SKIPPED }
     val history by viewModel.syncHistory
     val historyVisible by viewModel.historyVisible
+    val showDeletePrompt by viewModel.showDeletePrompt
+    val deletableUris by viewModel.deletableUris
+    val deleteStatus by viewModel.deleteStatus
+    val pendingSystemDelete by viewModel.pendingSystemDelete
+
+    val systemDeleteLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartIntentSenderForResult()
+    ) { result ->
+        viewModel.onSystemDeleteResult(result.resultCode == Activity.RESULT_OK)
+    }
+
+    LaunchedEffect(pendingSystemDelete) {
+        val sender = pendingSystemDelete ?: return@LaunchedEffect
+        try {
+            systemDeleteLauncher.launch(IntentSenderRequest.Builder(sender).build())
+        } catch (e: Exception) {
+            Log.e("CompleteScreen", "Failed to launch system delete", e)
+            viewModel.onSystemDeleteResult(false)
+        } finally {
+            viewModel.clearPendingSystemDelete()
+        }
+    }
+
+    if (showDeletePrompt && deletableUris.isNotEmpty()) {
+        AlertDialog(
+            onDismissRequest = { viewModel.declineDeleteLocalFiles() },
+            icon = { Icon(Icons.Default.Delete, contentDescription = null) },
+            title = { Text("Delete from device?") },
+            text = {
+                Text(
+                    "${deletableUris.size} file(s) were uploaded successfully. " +
+                        "Delete them from this phone to free space? " +
+                        "Files already on the server will not be affected."
+                )
+            },
+            confirmButton = {
+                Button(onClick = { viewModel.confirmDeleteLocalFiles() }) {
+                    Text("Delete from device")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { viewModel.declineDeleteLocalFiles() }) {
+                    Text("Keep files")
+                }
+            }
+        )
+    }
 
     Column(
         modifier = Modifier
@@ -627,7 +981,57 @@ fun CompleteScreen(progress: Map<String, UploadProgress>, viewModel: SyncViewMod
         Text("Failed: $failed", modifier = Modifier.padding(vertical = 4.dp))
         Text("Skipped: $skipped", modifier = Modifier.padding(vertical = 4.dp))
 
+        if (failed > 0) {
+            Spacer(modifier = Modifier.height(12.dp))
+            progress.values
+                .filter { it.status == UploadStatus.FAILED }
+                .take(5)
+                .forEach { item ->
+                    Text(
+                        "• ${item.fileInfo.filename}: ${item.errorMessage ?: "failed"}",
+                        color = Color.Red,
+                        fontSize = 12.sp,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 2.dp)
+                    )
+                }
+        }
+
+        deleteStatus?.let { status ->
+            Spacer(modifier = Modifier.height(12.dp))
+            Text(
+                status.message,
+                color = when {
+                    status.deleted > 0 && status.failed == 0 -> Color(0xFF2E7D32)
+                    status.failed > 0 -> Color(0xFFE65100)
+                    else -> Color.Gray
+                },
+                modifier = Modifier.padding(horizontal = 8.dp)
+            )
+        }
+
         Spacer(modifier = Modifier.height(24.dp))
+
+        if (deletableUris.isNotEmpty() && !showDeletePrompt && deleteStatus == null) {
+            Button(
+                onClick = { viewModel.confirmDeleteLocalFiles() },
+                modifier = Modifier.fillMaxWidth(),
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFC62828))
+            ) {
+                Icon(Icons.Default.Delete, contentDescription = null)
+                Spacer(modifier = Modifier.width(8.dp))
+                Text("Delete ${deletableUris.size} synced file(s)")
+            }
+            Spacer(modifier = Modifier.height(8.dp))
+            OutlinedButton(
+                onClick = { viewModel.declineDeleteLocalFiles() },
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("Keep files on device")
+            }
+            Spacer(modifier = Modifier.height(8.dp))
+        }
 
         Button(
             onClick = { viewModel.continueSyncing() },

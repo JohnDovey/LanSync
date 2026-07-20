@@ -3,10 +3,9 @@ package com.lansync.manager
 import android.util.Log
 import com.lansync.network.FileInfo
 import com.lansync.network.SyncClient
-import kotlinx.coroutines.*
-import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.atomic.AtomicInteger
 
 data class UploadProgress(
     val fileInfo: FileInfo,
@@ -27,54 +26,52 @@ data class ConflictResolution(
     val applyToAll: Boolean = false
 )
 
+/**
+ * Uploads files over a single [SyncClient] connection.
+ *
+ * Uploads run **sequentially** — the protocol supports one session per TCP
+ * connection, and the client mutex already serializes I/O.
+ */
 class UploadManager(
     private val syncClient: SyncClient,
-    private val maxConcurrent: Int = 10
+    @Suppress("UNUSED_PARAMETER") private val maxConcurrent: Int = 1
 ) {
     private val TAG = "UploadManager"
-    
-    private val activeUploads = AtomicInteger(0)
+
     private val uploadProgress = ConcurrentHashMap<String, UploadProgress>()
-    private val uploadJob = ConcurrentHashMap<String, Job>()
-    
-    private val scope = CoroutineScope(Dispatchers.IO + Job())
-    private val semaphore = Semaphore(maxConcurrent)
-    
+
     private var onProgressUpdate: ((Map<String, UploadProgress>) -> Unit)? = null
-    private var onConflict: ((FileInfo, suspend (ConflictResolution) -> Unit) -> Unit)? = null
     private var globalConflictResolution: ConflictResolution? = null
 
     fun setProgressCallback(callback: (Map<String, UploadProgress>) -> Unit) {
         onProgressUpdate = callback
     }
 
-    fun setConflictCallback(callback: (FileInfo, suspend (ConflictResolution) -> Unit) -> Unit) {
-        onConflict = callback
-    }
-
     suspend fun uploadFiles(
         files: List<Pair<FileInfo, ByteArray>>,
         onConflict: suspend (FileInfo) -> ConflictResolution?
-    ): Result<UploadSummary> = withContext(Dispatchers.Main.immediate) {
-        return@withContext try {
-            val uploadTasks = files.map { (fileInfo, fileData) ->
-                scope.launch {
-                    semaphore.acquire()
-                    try {
-                        activeUploads.incrementAndGet()
-                        uploadSingleFile(fileInfo, fileData, onConflict)
-                    } finally {
-                        semaphore.release()
-                        activeUploads.decrementAndGet()
-                    }
-                }
+    ): Result<UploadSummary> = withContext(Dispatchers.IO) {
+        globalConflictResolution = null
+        uploadProgress.clear()
+
+        // Seed progress so the UI shows every file immediately.
+        files.forEach { (fileInfo, fileData) ->
+            val key = progressKey(fileInfo)
+            uploadProgress[key] = UploadProgress(
+                fileInfo = fileInfo,
+                currentBytes = 0,
+                totalBytes = fileData.size.toLong(),
+                percentage = 0,
+                status = UploadStatus.PENDING
+            )
+        }
+        notifyProgress()
+
+        try {
+            for ((fileInfo, fileData) in files) {
+                uploadSingleFile(fileInfo, fileData, onConflict)
             }
-
-            // Wait for all uploads to complete
-            uploadTasks.joinAll()
-
-            val summary = generateSummary()
-            Result.success(summary)
+            Result.success(generateSummary())
         } catch (e: Exception) {
             Log.e(TAG, "Upload batch failed", e)
             Result.failure(e)
@@ -86,73 +83,117 @@ class UploadManager(
         fileData: ByteArray,
         onConflict: suspend (FileInfo) -> ConflictResolution?
     ) {
+        val key = progressKey(fileInfo)
         try {
-            updateProgress(fileInfo.filename, UploadStatus.UPLOADING)
+            updateProgress(key, fileInfo, UploadStatus.UPLOADING, currentBytes = 0, totalBytes = fileData.size.toLong())
 
-            // Check for duplicate
             val dupResult = syncClient.checkDuplicate(fileInfo)
             if (dupResult.isFailure) {
                 updateProgress(
-                    fileInfo.filename,
+                    key,
+                    fileInfo,
                     UploadStatus.FAILED,
+                    totalBytes = fileData.size.toLong(),
                     error = dupResult.exceptionOrNull()?.message ?: "Duplicate check failed"
                 )
                 return
             }
 
-            val (isDuplicate, shouldUpdate) = dupResult.getOrNull() ?: return
-            
-            if (isDuplicate && !shouldUpdate) {
-                // File exists and is identical - ask user
-                val resolution = onConflict(fileInfo)
+            val dup = dupResult.getOrNull() ?: return
+
+            if (dup.isDuplicate && !dup.shouldUpdate) {
+                // Identical file already on server — skip (or override if user chose apply-to-all).
+                val global = globalConflictResolution
+                val resolution = when {
+                    global != null -> global
+                    else -> onConflict(fileInfo)
+                }
+                if (resolution?.applyToAll == true) {
+                    globalConflictResolution = resolution
+                }
                 if (resolution == null || !resolution.overrideThisFile) {
-                    updateProgress(fileInfo.filename, UploadStatus.SKIPPED)
+                    updateProgress(
+                        key,
+                        fileInfo,
+                        UploadStatus.SKIPPED,
+                        currentBytes = fileData.size.toLong(),
+                        totalBytes = fileData.size.toLong()
+                    )
                     return
                 }
             }
 
-            // Proceed with upload
-            val uploadResult = syncClient.uploadFile(fileInfo, fileData)
+            val uploadResult = syncClient.uploadFile(fileInfo, fileData) { sent ->
+                updateProgress(
+                    key,
+                    fileInfo,
+                    UploadStatus.UPLOADING,
+                    currentBytes = sent,
+                    totalBytes = fileData.size.toLong()
+                )
+            }
+
             if (uploadResult.isSuccess) {
                 updateProgress(
-                    fileInfo.filename,
+                    key,
+                    fileInfo,
                     UploadStatus.COMPLETED,
-                    currentBytes = fileData.size.toLong()
+                    currentBytes = fileData.size.toLong(),
+                    totalBytes = fileData.size.toLong()
                 )
                 Log.i(TAG, "Successfully uploaded ${fileInfo.filename}")
             } else {
                 updateProgress(
-                    fileInfo.filename,
+                    key,
+                    fileInfo,
                     UploadStatus.FAILED,
+                    totalBytes = fileData.size.toLong(),
                     error = uploadResult.exceptionOrNull()?.message ?: "Upload failed"
                 )
             }
         } catch (e: Exception) {
             Log.e(TAG, "Upload error for ${fileInfo.filename}", e)
             updateProgress(
-                fileInfo.filename,
+                key,
+                fileInfo,
                 UploadStatus.FAILED,
+                totalBytes = fileData.size.toLong(),
                 error = e.message ?: "Unknown error"
             )
         }
     }
 
+    private fun progressKey(fileInfo: FileInfo): String =
+        "${fileInfo.filename}|${fileInfo.fileHash}"
+
     private fun updateProgress(
-        filename: String,
+        key: String,
+        fileInfo: FileInfo,
         status: UploadStatus,
         currentBytes: Long = 0,
+        totalBytes: Long = fileInfo.fileSize,
         error: String? = null
     ) {
-        val currentProgress = uploadProgress[filename]
-        uploadProgress[filename] = UploadProgress(
-            fileInfo = currentProgress?.fileInfo ?: FileInfo(filename, "", "", "", "", 0),
-            currentBytes = currentBytes,
-            totalBytes = currentProgress?.totalBytes ?: currentBytes,
-            percentage = if (currentProgress?.totalBytes == 0L) 0 
-                        else (currentBytes * 100 / (currentProgress?.totalBytes ?: 1)).toInt(),
+        val total = totalBytes.coerceAtLeast(0)
+        val current = currentBytes.coerceIn(0, if (total > 0) total else currentBytes)
+        val percentage = if (total <= 0) {
+            if (status == UploadStatus.COMPLETED || status == UploadStatus.SKIPPED) 100 else 0
+        } else {
+            ((current * 100) / total).toInt().coerceIn(0, 100)
+        }
+
+        uploadProgress[key] = UploadProgress(
+            fileInfo = fileInfo,
+            currentBytes = current,
+            totalBytes = total,
+            percentage = percentage,
             status = status,
             errorMessage = error
         )
+        notifyProgress()
+    }
+
+    private fun notifyProgress() {
         onProgressUpdate?.invoke(uploadProgress.toMap())
     }
 
@@ -160,19 +201,19 @@ class UploadManager(
         val progress = uploadProgress.values
         return UploadSummary(
             total = progress.size,
-            completed = progress.count { it.status == UploadStatus.COMPLETED }.toInt(),
-            failed = progress.count { it.status == UploadStatus.FAILED }.toInt(),
-            skipped = progress.count { it.status == UploadStatus.SKIPPED }.toInt(),
-            duplicates = progress.count { it.status == UploadStatus.DUPLICATE }.toInt()
+            completed = progress.count { it.status == UploadStatus.COMPLETED },
+            failed = progress.count { it.status == UploadStatus.FAILED },
+            skipped = progress.count { it.status == UploadStatus.SKIPPED },
+            duplicates = progress.count { it.status == UploadStatus.DUPLICATE }
         )
     }
 
     fun getProgress(): Map<String, UploadProgress> = uploadProgress.toMap()
 
-    suspend fun getActiveCount(): Int = activeUploads.get()
-
     fun cancel() {
-        scope.cancel()
+        // Connection close is owned by the ViewModel / SyncClient.
+        uploadProgress.clear()
+        notifyProgress()
     }
 }
 
