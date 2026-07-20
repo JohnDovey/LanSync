@@ -22,6 +22,9 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.safeDrawing
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -490,6 +493,8 @@ fun SyncMainScreen(viewModel: SyncViewModel) {
         modifier = Modifier
             .fillMaxSize()
             .background(Color(0xFFF5F5F5))
+            // Extra safety if the host still draws edge-to-edge.
+            .windowInsetsPadding(WindowInsets.safeDrawing)
     ) {
         when (uiState) {
             is UiState.Idle -> ConnectScreen(viewModel)
@@ -638,113 +643,124 @@ fun FilePickerScreen(viewModel: SyncViewModel) {
         contract = ActivityResultContracts.OpenMultipleDocuments()
     ) { uris -> addUris(uris) }
 
-    // Pin Start Sync in the bottom bar so it cannot be scrolled off-screen.
-    Scaffold(
-        containerColor = Color(0xFFF5F5F5),
-        bottomBar = {
-            Surface(
-                tonalElevation = 3.dp,
-                shadowElevation = 8.dp
-            ) {
-                Button(
-                    onClick = { viewModel.startSync(selectedFiles) },
-                    enabled = selectedFiles.isNotEmpty(),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(16.dp)
-                        .height(52.dp),
-                    shape = RoundedCornerShape(8.dp)
-                ) {
-                    Text(
-                        if (selectedFiles.isEmpty()) "Select files to sync" else "Start Sync (${selectedFiles.size})",
-                        fontSize = 16.sp
-                    )
+    // Layout: fixed header + Start Sync always visible near the top; only the
+    // file list scrolls. Avoids the primary action sitting under gesture nav.
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(horizontal = 16.dp)
+    ) {
+        Text(
+            "Select Files to Sync",
+            fontSize = 24.sp,
+            fontWeight = FontWeight.Bold,
+            modifier = Modifier.padding(top = 16.dp, bottom = 12.dp)
+        )
+
+        // Primary action — always on screen, never at the bottom edge.
+        Button(
+            onClick = { viewModel.startSync(selectedFiles) },
+            enabled = selectedFiles.isNotEmpty(),
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(56.dp),
+            shape = RoundedCornerShape(8.dp)
+        ) {
+            Icon(Icons.Default.CloudUpload, contentDescription = null)
+            Spacer(modifier = Modifier.width(8.dp))
+            Text(
+                if (selectedFiles.isEmpty()) {
+                    "Select files below, then sync"
+                } else {
+                    "Start Sync (${selectedFiles.size})"
+                },
+                fontSize = 16.sp,
+                fontWeight = FontWeight.SemiBold
+            )
+        }
+
+        Spacer(modifier = Modifier.height(16.dp))
+
+        Text("Add files", fontWeight = FontWeight.SemiBold)
+        Spacer(modifier = Modifier.height(8.dp))
+
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .horizontalScroll(rememberScrollState()),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Button(onClick = { pickImages.launch("image/*") }) {
+                Icon(Icons.Default.PhotoLibrary, contentDescription = null)
+                Spacer(modifier = Modifier.width(6.dp))
+                Text("Photos")
+            }
+            Spacer(modifier = Modifier.width(8.dp))
+            Button(onClick = { pickVideos.launch("video/*") }) {
+                Icon(Icons.Default.Videocam, contentDescription = null)
+                Spacer(modifier = Modifier.width(6.dp))
+                Text("Videos")
+            }
+            Spacer(modifier = Modifier.width(8.dp))
+            Button(onClick = { pickDocuments.launch(arrayOf("application/*", "text/*")) }) {
+                Icon(Icons.Default.Description, contentDescription = null)
+                Spacer(modifier = Modifier.width(6.dp))
+                Text("Documents")
+            }
+            Spacer(modifier = Modifier.width(8.dp))
+            Button(onClick = { pickAny.launch(arrayOf("*/*")) }) {
+                Icon(Icons.Default.Folder, contentDescription = null)
+                Spacer(modifier = Modifier.width(6.dp))
+                Text("Custom")
+            }
+        }
+
+        Spacer(modifier = Modifier.height(12.dp))
+
+        SuggestedDirectoriesCard(
+            onPhotos = { pickImages.launch("image/*") },
+            onDocuments = { pickDocuments.launch(arrayOf("application/*", "text/*")) },
+            onVideos = { pickVideos.launch("video/*") }
+        )
+
+        Spacer(modifier = Modifier.height(12.dp))
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                if (selectedFiles.isEmpty()) "No files selected" else "Selected (${selectedFiles.size})",
+                fontSize = 16.sp,
+                fontWeight = FontWeight.SemiBold
+            )
+            if (selectedFiles.isNotEmpty()) {
+                TextButton(onClick = { selectedFiles = emptyList() }) {
+                    Text("Clear")
                 }
             }
         }
-    ) { padding ->
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(padding)
-                .padding(horizontal = 16.dp)
-        ) {
+
+        if (selectedFiles.isEmpty()) {
             Text(
-                "Select Files to Sync",
-                fontSize = 24.sp,
-                fontWeight = FontWeight.Bold,
-                modifier = Modifier.padding(vertical = 16.dp)
+                "Use Photos, Videos, Documents, or Custom to choose files. Start Sync stays at the top.",
+                color = Color.Gray,
+                modifier = Modifier.padding(vertical = 8.dp)
             )
-
-            SuggestedDirectoriesCard(
-                onPhotos = { pickImages.launch("image/*") },
-                onDocuments = { pickDocuments.launch(arrayOf("application/*", "text/*")) },
-                onVideos = { pickVideos.launch("video/*") }
-            )
-
-            Spacer(modifier = Modifier.height(16.dp))
-
-            Row(
+        } else {
+            LazyColumn(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .horizontalScroll(rememberScrollState()),
-                verticalAlignment = Alignment.CenterVertically
+                    .weight(1f),
+                contentPadding = PaddingValues(bottom = 16.dp)
             ) {
-                Button(onClick = { pickImages.launch("image/*") }) {
-                    Icon(Icons.Default.PhotoLibrary, contentDescription = null)
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text("Photos")
-                }
-                Spacer(modifier = Modifier.width(8.dp))
-                Button(onClick = { pickDocuments.launch(arrayOf("application/*", "text/*")) }) {
-                    Icon(Icons.Default.Description, contentDescription = null)
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text("Documents")
-                }
-                Spacer(modifier = Modifier.width(8.dp))
-                Button(onClick = { pickAny.launch(arrayOf("*/*")) }) {
-                    Icon(Icons.Default.Folder, contentDescription = null)
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text("Custom")
-                }
-            }
-
-            Spacer(modifier = Modifier.height(16.dp))
-
-            if (selectedFiles.isNotEmpty()) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        "Selected Files (${selectedFiles.size})",
-                        fontSize = 16.sp,
-                        fontWeight = FontWeight.SemiBold
+                items(selectedFiles, key = { it.toString() }) { uri ->
+                    FileItemCard(
+                        filename = viewModel.displayName(uri),
+                        onRemove = { selectedFiles = selectedFiles.filterNot { it == uri } }
                     )
-                    TextButton(onClick = { selectedFiles = emptyList() }) {
-                        Text("Clear")
-                    }
                 }
-                LazyColumn(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .weight(1f),
-                    contentPadding = PaddingValues(bottom = 8.dp)
-                ) {
-                    items(selectedFiles, key = { it.toString() }) { uri ->
-                        FileItemCard(
-                            filename = viewModel.displayName(uri),
-                            onRemove = { selectedFiles = selectedFiles.filterNot { it == uri } }
-                        )
-                    }
-                }
-            } else {
-                Text(
-                    "Tap Photos, Documents, or Custom to choose files.",
-                    color = Color.Gray,
-                    modifier = Modifier.padding(vertical = 8.dp)
-                )
             }
         }
     }
