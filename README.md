@@ -10,6 +10,7 @@ This package contains a complete, production-ready file synchronization system:
 
 - **Go Server** (`server/`): Windows console app with TUI, SQLite, binary protocol
 - **Android App** (`android/`): Kotlin/Jetpack Compose with parallel uploads
+- **Windows Client** (`windows/`): Go + Fyne desktop app, same protocol/feature set as the Android app
 - **Documentation**:
   - `IMPLEMENTATION_GUIDE.md` — Full setup & architecture (17KB)
   - `PROTOCOL_REFERENCE.md` — Binary protocol specs & code examples (15KB)
@@ -79,6 +80,14 @@ lansync/
 │               ├── network/SyncClient.kt
 │               ├── manager/UploadManager.kt
 │               └── ui/SyncScreen.kt
+│
+├── windows/                    # Windows client (module: lansync-windows)
+│   ├── go.mod
+│   ├── build.ps1               # CLI build wrapper
+│   ├── main.go                 # app entry, window, screen switching
+│   ├── protocol.go             # binary protocol client (mirrors SyncClient.kt)
+│   ├── sync.go                 # upload orchestration (mirrors UploadManager.kt)
+│   └── ui_*.go                 # connect / picker / progress / complete screens
 │
 ├── IMPLEMENTATION_GUIDE.md     # Full setup guide
 ├── PROTOCOL_REFERENCE.md       # Binary protocol specs + code examples

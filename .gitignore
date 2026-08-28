@@ -7,6 +7,10 @@
 # Server runtime data (DB + uploaded files)
 /server/syncserver_data/
 
+# Windows client build artifacts
+/windows/lansync-windows
+/windows/lansync-windows.exe
+
 # Android / Gradle
 android/local.properties
 android/keystore.properties
