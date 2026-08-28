@@ -1,6 +1,8 @@
 package com.lansync.ui
 
+import android.Manifest
 import android.app.Activity
+import android.content.ContentUris
 import android.content.Context
 import android.content.Intent
 import android.content.IntentSender
@@ -609,19 +611,92 @@ class SyncViewModel(private val context: Context) : ViewModel() {
         return DeleteAttempt.Failed
     }
 
-    /** Translate a SAF document URI to its MediaStore URI, if the file is media-indexed. */
+    /**
+     * Translate a SAF document or Photo Picker URI to the real MediaStore URI for that
+     * file, if it's media-indexed.
+     *
+     * Tries [MediaStore.getMediaUri] first (documented for SAF/FileProvider documents;
+     * it rejects Photo Picker URIs with "Provider for this Uri is not supported" even
+     * though picker items are ordinary on-device MediaStore rows).
+     *
+     * For a Photo Picker URI (content://media/picker/<user>/<authority>/media/<id>) the
+     * trailing <id> IS the real MediaStore row id for local items — confirmed via
+     * `adb shell content query --uri content://media/external/file --where "_id=<id>"`,
+     * which returns the real row (e.g. IMG_20260828_101635.jpg) even though the picker's
+     * own DISPLAY_NAME for that same URI is a synthetic "<id>.<ext>" placeholder (privacy:
+     * apps with only picker-scoped access shouldn't see real camera filenames). That
+     * synthetic name is why a DISPLAY_NAME-based MediaStore query can never match — the
+     * id has to be read straight off the picker URI instead.
+     */
     private fun resolveMediaStoreUri(uri: Uri): Uri? {
+        runCatching { MediaStore.getMediaUri(context, uri) }.getOrNull()?.let { return it }
+
+        if (uri.authority == MediaStore.AUTHORITY && uri.pathSegments.firstOrNull() == "picker") {
+            uri.lastPathSegment?.toLongOrNull()?.let { id ->
+                return ContentUris.withAppendedId(mediaCollectionFor(uri), id)
+            }
+        }
+
+        return resolveMediaStoreUriByQuery(uri)
+    }
+
+    private fun resolveMediaStoreUriByQuery(uri: Uri): Uri? {
+        val name = displayName(uri)
+        if (name.isBlank() || name == "file") return null
+        val size = contentLength(uri)
+
+        // Search the unified Files collection (matches any media type by name/size), but
+        // createDeleteRequest() rejects that generic collection's URIs ("All requested
+        // items must be Media items") — the found id has to be re-wrapped in the specific
+        // Images/Video collection URI to actually be usable for a delete request.
+        val searchCollection = MediaStore.Files.getContentUri("external")
+        val projection = arrayOf(MediaStore.Files.FileColumns._ID)
+        val selection = StringBuilder("${MediaStore.Files.FileColumns.DISPLAY_NAME} = ?")
+        val args = mutableListOf(name)
+        if (size > 0) {
+            selection.append(" AND ${MediaStore.Files.FileColumns.SIZE} = ?")
+            args.add(size.toString())
+        }
+
         return try {
-            MediaStore.getMediaUri(context, uri)
+            context.contentResolver.query(
+                searchCollection,
+                projection,
+                selection.toString(),
+                args.toTypedArray(),
+                null
+            )?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val id = cursor.getLong(cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns._ID))
+                    ContentUris.withAppendedId(mediaCollectionFor(uri), id)
+                } else {
+                    null
+                }
+            }
         } catch (e: Exception) {
-            Log.w(TAG, "getMediaUri failed for $uri", e)
+            Log.w(TAG, "MediaStore query failed for $name", e)
             null
         }
     }
 
+    /** The specific MediaStore collection createDeleteRequest() will accept for this file. */
+    private fun mediaCollectionFor(uri: Uri): Uri {
+        val mimeType = context.contentResolver.getType(uri).orEmpty()
+        return if (mimeType.startsWith("video/")) {
+            MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+        } else {
+            MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+        }
+    }
+
+    // Real MediaStore item rows (content://media/external/... or /internal/...) are usable
+    // directly with createDeleteRequest(). The system Photo Picker's URIs also carry the
+    // "media" authority (content://media/picker/...) but createDeleteRequest rejects them —
+    // those must go through resolveMediaStoreUri()/getMediaUri() first, same as SAF documents.
     private fun isMediaStoreUri(uri: Uri): Boolean {
-        val authority = uri.authority ?: return false
-        return authority == MediaStore.AUTHORITY || authority.contains("media", ignoreCase = true)
+        if (uri.authority != MediaStore.AUTHORITY) return false
+        val path = uri.path ?: return false
+        return path.startsWith("/external/") || path.startsWith("/internal/")
     }
 
     fun takePersistablePermissions(uris: List<Uri>) {
@@ -1676,6 +1751,24 @@ fun CompleteScreen(progress: Map<String, UploadProgress>, viewModel: SyncViewMod
         viewModel.onSystemDeleteResult(result.resultCode == Activity.RESULT_OK)
     }
 
+    // READ_MEDIA_IMAGES/VIDEO let the app look up a gallery-picked file's real MediaStore
+    // row by name when it only holds a Photo Picker or SAF URI, which is required to
+    // request its deletion. Proceed either way — deletion just can't resolve extra items
+    // if the user declines, same as before this permission existed.
+    val mediaPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestMultiplePermissions()
+    ) {
+        viewModel.confirmDeleteLocalFiles()
+    }
+    fun startDelete() {
+        val permissions = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            arrayOf(Manifest.permission.READ_MEDIA_IMAGES, Manifest.permission.READ_MEDIA_VIDEO)
+        } else {
+            arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE)
+        }
+        mediaPermissionLauncher.launch(permissions)
+    }
+
     LaunchedEffect(pendingSystemDelete) {
         val sender = pendingSystemDelete ?: return@LaunchedEffect
         try {
@@ -1701,7 +1794,7 @@ fun CompleteScreen(progress: Map<String, UploadProgress>, viewModel: SyncViewMod
                 )
             },
             confirmButton = {
-                Button(onClick = { viewModel.confirmDeleteLocalFiles() }) {
+                Button(onClick = { startDelete() }) {
                     Text("Delete from device")
                 }
             },
@@ -1762,7 +1855,7 @@ fun CompleteScreen(progress: Map<String, UploadProgress>, viewModel: SyncViewMod
 
         if (deletableUris.isNotEmpty() && !showDeletePrompt && deleteStatus == null) {
             Button(
-                onClick = { viewModel.confirmDeleteLocalFiles() },
+                onClick = { startDelete() },
                 modifier = Modifier.fillMaxWidth(),
                 colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFC62828))
             ) {
