@@ -35,6 +35,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.lansync.FailedSyncEntry
+import com.lansync.FailedSyncStore
 import com.lansync.SavedSettings
 import com.lansync.SettingsStore
 import com.lansync.manager.ConflictResolution
@@ -57,6 +59,11 @@ import kotlinx.coroutines.withContext
 
 class SyncViewModel(private val context: Context) : ViewModel() {
     private val settingsStore = SettingsStore(context)
+    private val failedSyncStore = FailedSyncStore(context)
+
+    /** Failed uploads kept across app restarts so they can be retried or dismissed. */
+    private val _failedSyncs = mutableStateOf(failedSyncStore.load())
+    val failedSyncs: State<List<FailedSyncEntry>> = _failedSyncs
 
     /** App version shown in the header and About screen. */
     val appVersionName: String = try {
@@ -196,6 +203,8 @@ class SyncViewModel(private val context: Context) : ViewModel() {
                     }
                 }
 
+                reconcileFailedSyncs(manager.getProgress())
+
                 _deletableUris.value = completedUris.distinct()
                 _showDeletePrompt.value = completedUris.isNotEmpty()
                 _uiState.value = UiState.Complete
@@ -221,6 +230,53 @@ class SyncViewModel(private val context: Context) : ViewModel() {
                 _uiState.value = UiState.Syncing
             }
         }
+    }
+
+    /**
+     * Update the persisted failed-syncs list from this run's outcomes: files that
+     * now succeeded (or were skipped/duplicate) are cleared, files that failed are
+     * kept (or updated) so they can be retried later, including after a restart.
+     */
+    private fun reconcileFailedSyncs(runProgress: Map<String, UploadProgress>) {
+        val resolved = _failedSyncs.value.toMutableList()
+        for (p in runProgress.values) {
+            val uriStr = p.fileInfo.filePath
+            when (p.status) {
+                UploadStatus.FAILED -> {
+                    resolved.removeAll { it.uri == uriStr }
+                    resolved.add(
+                        FailedSyncEntry(
+                            uri = uriStr,
+                            relativePath = if (p.fileInfo.fileType == "folders") p.fileInfo.filename else null,
+                            displayName = p.fileInfo.filename,
+                            errorMessage = p.errorMessage ?: "Failed",
+                            timestamp = System.currentTimeMillis()
+                        )
+                    )
+                }
+                UploadStatus.COMPLETED, UploadStatus.DUPLICATE, UploadStatus.SKIPPED ->
+                    resolved.removeAll { it.uri == uriStr }
+                else -> {}
+            }
+        }
+        _failedSyncs.value = resolved
+        failedSyncStore.save(resolved)
+    }
+
+    /** Re-queue previously failed files for another sync attempt. */
+    fun retryFailedSyncs(entries: List<FailedSyncEntry>) {
+        val items = entries.mapNotNull { entry ->
+            runCatching { SelectedItem(uri = Uri.parse(entry.uri), relativePath = entry.relativePath) }
+                .getOrNull()
+        }
+        if (items.isNotEmpty()) startSync(items)
+    }
+
+    /** Forget failed files without retrying (batch dismiss). */
+    fun dismissFailedSyncs(entries: List<FailedSyncEntry>) {
+        val keys = entries.map { it.uri }.toSet()
+        _failedSyncs.value = _failedSyncs.value.filterNot { it.uri in keys }
+        failedSyncStore.save(_failedSyncs.value)
     }
 
     fun resolveConflict(override: Boolean, applyToAll: Boolean) {
@@ -1023,7 +1079,11 @@ fun FilePickerScreen(viewModel: SyncViewModel) {
     var selectedItems by remember { mutableStateOf<List<SelectedItem>>(emptyList()) }
     var isScanningFolder by remember { mutableStateOf(false) }
     var statusMessage by remember { mutableStateOf<String?>(null) }
+    // Checked-for-removal set, keyed the same way as the LazyColumn item key below.
+    var checkedForRemoval by remember { mutableStateOf<Set<String>>(emptySet()) }
     val scope = rememberCoroutineScope()
+
+    fun itemKey(item: SelectedItem) = "${item.uri}|${item.relativePath.orEmpty()}"
 
     fun addItems(items: List<SelectedItem>) {
         if (items.isEmpty()) return
@@ -1232,15 +1292,50 @@ fun FilePickerScreen(viewModel: SyncViewModel) {
                 fontWeight = FontWeight.SemiBold
             )
             if (selectedItems.isNotEmpty()) {
-                TextButton(
-                    onClick = {
-                        selectedItems = emptyList()
-                        statusMessage = null
-                    },
-                    enabled = !isScanningFolder
-                ) {
-                    Text("Clear")
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    if (checkedForRemoval.isNotEmpty()) {
+                        TextButton(
+                            onClick = {
+                                selectedItems = selectedItems.filterNot { itemKey(it) in checkedForRemoval }
+                                checkedForRemoval = emptySet()
+                            },
+                            enabled = !isScanningFolder
+                        ) {
+                            Text("Remove (${checkedForRemoval.size})")
+                        }
+                    }
+                    TextButton(
+                        onClick = {
+                            selectedItems = emptyList()
+                            checkedForRemoval = emptySet()
+                            statusMessage = null
+                        },
+                        enabled = !isScanningFolder
+                    ) {
+                        Text("Clear")
+                    }
                 }
+            }
+        }
+
+        if (selectedItems.isNotEmpty()) {
+            val allKeys = selectedItems.map(::itemKey).toSet()
+            val allChecked = checkedForRemoval.isNotEmpty() && checkedForRemoval.containsAll(allKeys)
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable {
+                        checkedForRemoval = if (allChecked) emptySet() else allKeys
+                    }
+            ) {
+                Checkbox(
+                    checked = allChecked,
+                    onCheckedChange = { checked ->
+                        checkedForRemoval = if (checked) allKeys else emptySet()
+                    }
+                )
+                Text("Select all", fontSize = 14.sp, color = Color.Gray)
             }
         }
 
@@ -1273,15 +1368,25 @@ fun FilePickerScreen(viewModel: SyncViewModel) {
             ) {
                 items(
                     visible,
-                    key = { "${it.uri}|${it.relativePath.orEmpty()}" }
+                    key = { itemKey(it) }
                 ) { item ->
+                    val key = itemKey(item)
                     FileItemCard(
                         filename = item.relativePath
                             ?: viewModel.displayName(item.uri),
+                        checked = key in checkedForRemoval,
+                        onCheckedChange = { checked ->
+                            checkedForRemoval = if (checked) {
+                                checkedForRemoval + key
+                            } else {
+                                checkedForRemoval - key
+                            }
+                        },
                         onRemove = {
                             selectedItems = selectedItems.filterNot {
                                 it.uri == item.uri && it.relativePath == item.relativePath
                             }
+                            checkedForRemoval = checkedForRemoval - key
                         }
                     )
                 }
@@ -1326,17 +1431,27 @@ fun SuggestedDirectoriesCard(
 }
 
 @Composable
-fun FileItemCard(filename: String, onRemove: (() -> Unit)? = null) {
+fun FileItemCard(
+    filename: String,
+    checked: Boolean = false,
+    onCheckedChange: ((Boolean) -> Unit)? = null,
+    onRemove: (() -> Unit)? = null
+) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
             .padding(vertical = 8.dp)
             .background(Color.White, RoundedCornerShape(8.dp))
-            .padding(12.dp),
+            .padding(horizontal = 4.dp, vertical = 4.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        Icon(Icons.Default.CheckCircle, contentDescription = null, tint = Color.Green)
-        Spacer(modifier = Modifier.width(12.dp))
+        if (onCheckedChange != null) {
+            Checkbox(checked = checked, onCheckedChange = onCheckedChange)
+        } else {
+            Spacer(modifier = Modifier.width(12.dp))
+            Icon(Icons.Default.CheckCircle, contentDescription = null, tint = Color.Green)
+            Spacer(modifier = Modifier.width(12.dp))
+        }
         Text(filename, modifier = Modifier.weight(1f))
         if (onRemove != null) {
             IconButton(onClick = onRemove) {
@@ -1446,17 +1561,33 @@ fun ProgressItemCard(progress: UploadProgress) {
 
 @Composable
 fun ConflictDialogScreen(fileInfo: FileInfo, viewModel: SyncViewModel) {
+    var applyToAll by remember { mutableStateOf(false) }
+
     AlertDialog(
-        onDismissRequest = { viewModel.resolveConflict(false, false) },
+        onDismissRequest = { viewModel.resolveConflict(false, applyToAll) },
         title = { Text("Duplicate File") },
-        text = { Text("'${fileInfo.filename}' already exists. Override?") },
+        text = {
+            Column {
+                Text("'${fileInfo.filename}' already exists. Override?")
+                Spacer(modifier = Modifier.height(12.dp))
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { applyToAll = !applyToAll }
+                ) {
+                    Checkbox(checked = applyToAll, onCheckedChange = { applyToAll = it })
+                    Text("Apply to all remaining duplicates")
+                }
+            }
+        },
         confirmButton = {
-            Button(onClick = { viewModel.resolveConflict(true, false) }) {
+            Button(onClick = { viewModel.resolveConflict(true, applyToAll) }) {
                 Text("Override")
             }
         },
         dismissButton = {
-            Button(onClick = { viewModel.resolveConflict(false, false) }) {
+            Button(onClick = { viewModel.resolveConflict(false, applyToAll) }) {
                 Text("Skip")
             }
         }
@@ -1675,6 +1806,12 @@ fun CompleteScreen(progress: Map<String, UploadProgress>, viewModel: SyncViewMod
         }
 
         if (historyVisible) {
+            val failedSyncs by viewModel.failedSyncs
+            if (failedSyncs.isNotEmpty()) {
+                Spacer(modifier = Modifier.height(16.dp))
+                FailedSyncsSection(failedSyncs = failedSyncs, viewModel = viewModel)
+            }
+
             Spacer(modifier = Modifier.height(16.dp))
             Text("Sync History", fontWeight = FontWeight.SemiBold)
             if (history.isEmpty()) {
@@ -1683,6 +1820,92 @@ fun CompleteScreen(progress: Map<String, UploadProgress>, viewModel: SyncViewMod
                 history.forEach { entry ->
                     Text(entry, modifier = Modifier.padding(vertical = 4.dp))
                 }
+            }
+        }
+    }
+}
+
+/** Failed uploads kept across restarts, with select-all + retry/dismiss in bulk. */
+@Composable
+fun FailedSyncsSection(failedSyncs: List<FailedSyncEntry>, viewModel: SyncViewModel) {
+    var checked by remember(failedSyncs) { mutableStateOf<Set<String>>(emptySet()) }
+    val allChecked = checked.isNotEmpty() && checked.size == failedSyncs.size
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(Color(0xFFFFF3E0), RoundedCornerShape(8.dp))
+            .padding(12.dp)
+    ) {
+        Text(
+            "Failed Syncs (${failedSyncs.size})",
+            fontWeight = FontWeight.SemiBold,
+            color = Color(0xFFE65100)
+        )
+        Spacer(modifier = Modifier.height(8.dp))
+
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable {
+                    checked = if (allChecked) emptySet() else failedSyncs.map { it.uri }.toSet()
+                }
+        ) {
+            Checkbox(
+                checked = allChecked,
+                onCheckedChange = { isChecked ->
+                    checked = if (isChecked) failedSyncs.map { it.uri }.toSet() else emptySet()
+                }
+            )
+            Text("Select all", fontSize = 14.sp, color = Color.Gray)
+        }
+
+        failedSyncs.forEach { entry ->
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable {
+                        checked = if (entry.uri in checked) checked - entry.uri else checked + entry.uri
+                    }
+            ) {
+                Checkbox(
+                    checked = entry.uri in checked,
+                    onCheckedChange = { isChecked ->
+                        checked = if (isChecked) checked + entry.uri else checked - entry.uri
+                    }
+                )
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(entry.displayName, fontSize = 13.sp)
+                    Text(entry.errorMessage, fontSize = 11.sp, color = Color.Gray, maxLines = 2)
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(8.dp))
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Button(
+                onClick = {
+                    val selected = failedSyncs.filter { it.uri in checked }
+                    checked = emptySet()
+                    viewModel.retryFailedSyncs(selected)
+                },
+                enabled = checked.isNotEmpty(),
+                modifier = Modifier.weight(1f)
+            ) {
+                Text("Retry (${checked.size})")
+            }
+            OutlinedButton(
+                onClick = {
+                    val selected = failedSyncs.filter { it.uri in checked }
+                    checked = emptySet()
+                    viewModel.dismissFailedSyncs(selected)
+                },
+                enabled = checked.isNotEmpty(),
+                modifier = Modifier.weight(1f)
+            ) {
+                Text("Remove (${checked.size})")
             }
         }
     }
