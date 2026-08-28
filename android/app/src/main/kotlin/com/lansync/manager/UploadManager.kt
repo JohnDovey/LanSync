@@ -107,6 +107,15 @@ class UploadManager(
             val dup = dupResult.getOrNull() ?: return@withContext
 
             if (dup.isDuplicate && !dup.shouldUpdate) {
+                // Byte-identical file already on the server (RESP_DUPLICATE) — nothing
+                // to ask about, just skip.
+                updateProgress(key, fileInfo, UploadStatus.DUPLICATE, currentBytes = total, totalBytes = total)
+                return@withContext
+            }
+
+            if (dup.isDuplicate && dup.shouldUpdate) {
+                // Same filename, different content (RESP_NEED_UPDATE) — this is the
+                // actual conflict: ask before overwriting.
                 val global = globalConflictResolution
                 val resolution = when {
                     global != null -> global

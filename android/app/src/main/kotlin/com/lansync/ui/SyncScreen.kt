@@ -1170,15 +1170,18 @@ fun FilePickerScreen(viewModel: SyncViewModel) {
         addItems(uris.map { SelectedItem(uri = it, relativePath = null) })
     }
 
+    // SAF's file browser (not the system Photo Picker) so "Select all" is available from
+    // its overflow menu — the Photo Picker deliberately has no select-all (Android privacy
+    // design), which was the actual complaint: no way to bulk-pick a big photo dump.
     val pickImages = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.GetMultipleContents()
+        contract = ActivityResultContracts.OpenMultipleDocuments()
     ) { uris ->
         addUris(uris)
         if (uris.isNotEmpty()) statusMessage = "Added ${uris.size} photo(s)"
     }
 
     val pickVideos = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.GetMultipleContents()
+        contract = ActivityResultContracts.OpenMultipleDocuments()
     ) { uris ->
         addUris(uris)
         if (uris.isNotEmpty()) statusMessage = "Added ${uris.size} video(s)"
@@ -1280,7 +1283,7 @@ fun FilePickerScreen(viewModel: SyncViewModel) {
             verticalAlignment = Alignment.CenterVertically
         ) {
             Button(
-                onClick = { pickImages.launch("image/*") },
+                onClick = { pickImages.launch(arrayOf("image/*")) },
                 enabled = !isScanningFolder
             ) {
                 Icon(Icons.Default.PhotoLibrary, contentDescription = null)
@@ -1289,7 +1292,7 @@ fun FilePickerScreen(viewModel: SyncViewModel) {
             }
             Spacer(modifier = Modifier.width(8.dp))
             Button(
-                onClick = { pickVideos.launch("video/*") },
+                onClick = { pickVideos.launch(arrayOf("video/*")) },
                 enabled = !isScanningFolder
             ) {
                 Icon(Icons.Default.Videocam, contentDescription = null)
@@ -1328,9 +1331,9 @@ fun FilePickerScreen(viewModel: SyncViewModel) {
         Spacer(modifier = Modifier.height(12.dp))
 
         SuggestedDirectoriesCard(
-            onPhotos = { pickImages.launch("image/*") },
+            onPhotos = { pickImages.launch(arrayOf("image/*")) },
             onDocuments = { pickDocuments.launch(arrayOf("application/*", "text/*")) },
-            onVideos = { pickVideos.launch("video/*") },
+            onVideos = { pickVideos.launch(arrayOf("video/*")) },
             onFolder = { pickFolder.launch(null) }
         )
 
@@ -1621,6 +1624,7 @@ fun ProgressItemCard(progress: UploadProgress) {
                     UploadStatus.COMPLETED -> "✓ Completed"
                     UploadStatus.FAILED -> "✗ Failed: ${progress.errorMessage}"
                     UploadStatus.SKIPPED -> "⊘ Skipped"
+                    UploadStatus.DUPLICATE -> "⊙ Already synced"
                     else -> progress.status.name
                 },
                 fontSize = 12.sp,
@@ -1738,6 +1742,7 @@ fun CompleteScreen(progress: Map<String, UploadProgress>, viewModel: SyncViewMod
     val completed = progress.count { it.value.status == UploadStatus.COMPLETED }
     val failed = progress.count { it.value.status == UploadStatus.FAILED }
     val skipped = progress.count { it.value.status == UploadStatus.SKIPPED }
+    val duplicates = progress.count { it.value.status == UploadStatus.DUPLICATE }
     val history by viewModel.syncHistory
     val historyVisible by viewModel.historyVisible
     val showDeletePrompt by viewModel.showDeletePrompt
@@ -1826,6 +1831,9 @@ fun CompleteScreen(progress: Map<String, UploadProgress>, viewModel: SyncViewMod
         Text("Completed: $completed", modifier = Modifier.padding(vertical = 4.dp))
         Text("Failed: $failed", modifier = Modifier.padding(vertical = 4.dp))
         Text("Skipped: $skipped", modifier = Modifier.padding(vertical = 4.dp))
+        if (duplicates > 0) {
+            Text("Already synced: $duplicates", modifier = Modifier.padding(vertical = 4.dp))
+        }
 
         if (failed > 0) {
             Spacer(modifier = Modifier.height(12.dp))
