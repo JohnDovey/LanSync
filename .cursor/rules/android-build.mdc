@@ -16,6 +16,11 @@ WalkieTalkie's `android-build.mdc` precedent:
 - **`android/android-build.sh`**: wrapper script that sources `~/source-john-dovey.sh --quiet`,
   cds to its own directory, chmods `gradlew` executable, defaults to `assembleDebug` when no
   args are given, and forwards all args/flags to `./gradlew`.
+- **`android/android-build.ps1`**: Windows counterpart of `android-build.sh` — sources
+  `F:\Android\source-android-dev.ps1 -Quiet`, same args-passthrough/default-task behavior.
+- **`android/build-install.ps1`**: one-shot build+install on a connected device
+  (`gradlew installDebug`; `-Release` switches to `installRelease`, which needs a
+  `signingConfig` added to `app/build.gradle.kts` first — release isn't signed yet).
 - **`android/settings.gradle.kts`**: enables `STABLE_CONFIGURATION_CACHE`; uses
   `google()`/`mavenCentral()`/`gradlePluginPortal()` repos with `FAIL_ON_PROJECT_REPOS` mode.
 - **Versions**: matched to ClonesApp's current pins as of 2026-07 (AGP 8.13.2, Kotlin 2.0.0,

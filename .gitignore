@@ -9,6 +9,8 @@
 
 # Android / Gradle
 android/local.properties
+android/keystore.properties
+*.jks
 android/**/build/
 android/.gradle/
 android/**/*.iml
