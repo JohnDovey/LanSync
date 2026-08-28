@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -50,6 +51,16 @@ type SyncHistory struct {
 	Message   string
 	CreatedAt time.Time
 }
+
+// ServerVersion: this server's own version. Major.Minor.Patch per
+// .cursor/rules/versioning.mdc — Patch = bug fix/small change, Minor = new
+// feature or a major fix, Major = releases only.
+const ServerVersion = "1.0.0"
+
+// LatestAndroidAppVersion: the Android companion app version this server expects.
+// Keep in lockstep with android/app/build.gradle.kts versionName whenever that's
+// bumped — used only to flag outdated clients in the server log at connect time.
+const LatestAndroidAppVersion = "1.1.0"
 
 // Binary Protocol Commands
 const (
@@ -99,6 +110,7 @@ func initDB(dbPath string) (*sql.DB, error) {
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		user_id INTEGER NOT NULL,
 		device_name TEXT NOT NULL,
+		app_version TEXT,
 		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 		FOREIGN KEY(user_id) REFERENCES users(id),
 		UNIQUE(user_id, device_name)
@@ -140,8 +152,18 @@ func initDB(dbPath string) (*sql.DB, error) {
 	CREATE INDEX IF NOT EXISTS idx_history_created ON sync_history(created_at);
 	`
 
-	_, err = db.Exec(schema)
-	return db, err
+	if _, err = db.Exec(schema); err != nil {
+		return nil, err
+	}
+
+	// Migration: DBs created before app_version existed won't have the column.
+	// Ignore the "duplicate column" error when it's already present (fresh DB).
+	if _, err := db.Exec(`ALTER TABLE devices ADD COLUMN app_version TEXT`); err != nil &&
+		!strings.Contains(err.Error(), "duplicate column") {
+		return nil, err
+	}
+
+	return db, nil
 }
 
 // ============================================================================
@@ -164,20 +186,25 @@ func (s *Server) getOrCreateUser(username string) (int64, error) {
 	return userID, err
 }
 
-func (s *Server) getOrCreateDevice(userID int64, deviceName string) (int64, error) {
+func (s *Server) getOrCreateDevice(userID int64, deviceName, appVersion string) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	var deviceID int64
 	err := s.db.QueryRow("SELECT id FROM devices WHERE user_id = ? AND device_name = ?", userID, deviceName).Scan(&deviceID)
 	if err == sql.ErrNoRows {
-		result, err := s.db.Exec("INSERT INTO devices (user_id, device_name) VALUES (?, ?)", userID, deviceName)
+		result, err := s.db.Exec("INSERT INTO devices (user_id, device_name, app_version) VALUES (?, ?, ?)", userID, deviceName, appVersion)
 		if err != nil {
 			return 0, err
 		}
 		return result.LastInsertId()
 	}
-	return deviceID, err
+	if err != nil {
+		return 0, err
+	}
+	// Keep the recorded app_version current on every reconnect.
+	_, _ = s.db.Exec("UPDATE devices SET app_version = ? WHERE id = ?", appVersion, deviceID)
+	return deviceID, nil
 }
 
 // checkDuplicate looks up the existing row (if any) for this filename on
@@ -418,6 +445,29 @@ func isBenignDisconnect(err error) bool {
 		strings.Contains(msg, "connection aborted")
 }
 
+// compareVersions compares two Major.Minor.Patch version strings numerically,
+// returning -1, 0, or 1. Non-numeric or missing parts are treated as 0, so
+// malformed input degrades to a harmless comparison rather than an error.
+func compareVersions(a, b string) int {
+	pa, pb := strings.Split(a, "."), strings.Split(b, ".")
+	for i := 0; i < 3; i++ {
+		var na, nb int
+		if i < len(pa) {
+			na, _ = strconv.Atoi(pa[i])
+		}
+		if i < len(pb) {
+			nb, _ = strconv.Atoi(pb[i])
+		}
+		if na != nb {
+			if na < nb {
+				return -1
+			}
+			return 1
+		}
+	}
+	return 0
+}
+
 const maxChunkSize = 16 * 1024 * 1024 // 16 MiB hard cap
 
 // ============================================================================
@@ -532,6 +582,10 @@ func (s *Server) handleClient(conn net.Conn) {
 	if err != nil {
 		return
 	}
+	appVersion, err := readString(reader)
+	if err != nil {
+		return
+	}
 
 	userID, err := s.getOrCreateUser(username)
 	if err != nil {
@@ -539,7 +593,7 @@ func (s *Server) handleClient(conn net.Conn) {
 		return
 	}
 
-	deviceID, err := s.getOrCreateDevice(userID, deviceName)
+	deviceID, err := s.getOrCreateDevice(userID, deviceName, appVersion)
 	if err != nil {
 		_ = writeResp(writer, RESP_ERROR)
 		return
@@ -549,7 +603,11 @@ func (s *Server) handleClient(conn net.Conn) {
 		return
 	}
 
-	fmt.Printf("Client connected: user=%q device=%q from %s\n", username, deviceName, conn.RemoteAddr())
+	outdated := ""
+	if appVersion != "" && appVersion != "unknown" && compareVersions(appVersion, LatestAndroidAppVersion) < 0 {
+		outdated = fmt.Sprintf(" [outdated app, server expects v%s]", LatestAndroidAppVersion)
+	}
+	fmt.Printf("Client connected: user=%q device=%q app=%s from %s%s\n", username, deviceName, appVersion, conn.RemoteAddr(), outdated)
 	s.commandLoop(conn, reader, writer, userID, deviceID)
 	fmt.Printf("Client disconnected: %s\n", conn.RemoteAddr())
 }
@@ -814,17 +872,65 @@ const clearScreen = "\033[H\033[2J"
 
 func (s *Server) displayStatus() {
 	fmt.Print(clearScreen)
-	fmt.Println("╔════════════════════════════════════════════════════════════╗")
-	fmt.Println("║        LanSync Server                                       ║")
-	fmt.Println("╚════════════════════════════════════════════════════════════╝")
-	fmt.Printf("Port:        %d\n", s.config.Port)
-	fmt.Printf("Data Dir:    %s\n", s.config.DataDir)
-	fmt.Printf("Storage:     %s\n", s.config.StoragePath)
-	fmt.Println("\nCommands:")
+	printBanner(s.config)
+	fmt.Println("Commands:")
 	fmt.Println("  h - Show sync history")
 	fmt.Println("  s - Server stats")
 	fmt.Println("  q - Quit")
 	fmt.Println("")
+}
+
+// printBanner writes a VirtBBS-style boxed header (see QuakeMeshHub, VirtBBS)
+// with program name, version, host IP, and listener/storage paths. Called
+// once at startup (so it lands in ServiceMonitor's headless log) and again
+// atop every interactive TUI redraw.
+func printBanner(cfg Config) {
+	const w = 60
+	border := strings.Repeat("═", w)
+	pad := func(s string) string {
+		n := len([]rune(s))
+		if n >= w {
+			return string([]rune(s)[:w])
+		}
+		return s + strings.Repeat(" ", w-n)
+	}
+	line := func(s string) { fmt.Printf("║ %s ║\n", pad(s)) }
+	sep := func() { fmt.Printf("╠═%s═╣\n", border) }
+
+	fmt.Printf("╔═%s═╗\n", border)
+	line("")
+	line(fmt.Sprintf("  LanSync Server  v%s", ServerVersion))
+	line("  LAN file sync — Android to desktop")
+	line(fmt.Sprintf("  Host IP      %s", hostIP()))
+	line("")
+	sep()
+	line("  LISTENERS")
+	sep()
+	line(fmt.Sprintf("  Sync protocol   0.0.0.0:%d", cfg.Port))
+	sep()
+	line("  STORAGE")
+	sep()
+	line(fmt.Sprintf("  Data Dir     %s", cfg.DataDir))
+	line(fmt.Sprintf("  Storage      %s", cfg.StoragePath))
+	line(fmt.Sprintf("  Database     %s", cfg.DBPath))
+	line("")
+	fmt.Printf("╚═%s═╝\n", border)
+	fmt.Println()
+}
+
+// hostIP returns this machine's LAN-facing address — what Android clients
+// should enter to connect — via a UDP "connect" that never sends a packet;
+// it just asks the routing table which local interface would be used.
+func hostIP() string {
+	conn, err := net.Dial("udp", "8.8.8.8:80")
+	if err != nil {
+		return "(unknown)"
+	}
+	defer conn.Close()
+	if addr, ok := conn.LocalAddr().(*net.UDPAddr); ok && addr.IP != nil {
+		return addr.IP.String()
+	}
+	return "(unknown)"
 }
 
 func (s *Server) showStats() {
@@ -876,7 +982,7 @@ func main() {
 	}
 	defer listener.Close()
 
-	fmt.Printf("LanSync server listening on port %d\n", config.Port)
+	printBanner(config)
 
 	// Accept loop exits cleanly when the listener is closed on shutdown.
 	// Without this check, Close() surfaces as a noisy "use of closed network
