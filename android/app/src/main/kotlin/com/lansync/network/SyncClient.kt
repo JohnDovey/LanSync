@@ -41,7 +41,9 @@ data class ServerConfig(
     val host: String,
     val port: Int,
     val username: String,
-    val deviceName: String
+    val deviceName: String,
+    /** This app's versionName, sent during handshake so the server can log outdated clients. */
+    val appVersion: String = "unknown"
 )
 
 data class FileInfo(
@@ -198,6 +200,7 @@ class SyncClient(private val config: ServerConfig) {
             out.writeByte(BinaryProtocol.CMD_HANDSHAKE.toInt() and 0xFF)
             writeString(out, config.username)
             writeString(out, config.deviceName)
+            writeString(out, config.appVersion)
             out.flush()
 
             val response = inp.readByte()

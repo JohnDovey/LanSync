@@ -12,8 +12,13 @@ android {
         applicationId = "com.lansync"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0.0"
+        // versionCode: plain build counter, +1 every release (strictly increasing install id).
+        versionCode = 2
+        // versionName: Major.Minor.Patch per .cursor/rules/versioning.mdc — Patch = bug fix/small
+        // change, Minor = new feature or a major fix, Major = releases only (bump only when
+        // explicitly cutting a release). This build adds the About screen/header (feature) and
+        // fixes DCIM/gallery delete permissions (major fix), so it's a Minor bump.
+        versionName = "1.1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {

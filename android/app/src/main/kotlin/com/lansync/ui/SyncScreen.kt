@@ -19,6 +19,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.InsertDriveFile
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
@@ -56,6 +57,13 @@ import kotlinx.coroutines.withContext
 
 class SyncViewModel(private val context: Context) : ViewModel() {
     private val settingsStore = SettingsStore(context)
+
+    /** App version shown in the header and About screen. */
+    val appVersionName: String = try {
+        context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: "?"
+    } catch (e: Exception) {
+        "?"
+    }
 
     private val _uiState = mutableStateOf<UiState>(UiState.Idle)
     val uiState: State<UiState> = _uiState
@@ -396,9 +404,9 @@ class SyncViewModel(private val context: Context) : ViewModel() {
 
                 val attempt = withContext(Dispatchers.IO) { tryDeleteUri(uri) }
                 when (attempt) {
-                    DeleteAttempt.Success -> deleted++
-                    DeleteAttempt.NeedsUserConsent -> needConsent.add(uri)
-                    DeleteAttempt.Failed -> failed++
+                    is DeleteAttempt.Success -> deleted++
+                    is DeleteAttempt.NeedsUserConsent -> needConsent.add(attempt.mediaUri)
+                    is DeleteAttempt.Failed -> failed++
                 }
 
                 publish(
@@ -498,7 +506,11 @@ class SyncViewModel(private val context: Context) : ViewModel() {
         directFailedCount = 0
     }
 
-    private enum class DeleteAttempt { Success, NeedsUserConsent, Failed }
+    private sealed class DeleteAttempt {
+        object Success : DeleteAttempt()
+        data class NeedsUserConsent(val mediaUri: Uri) : DeleteAttempt()
+        object Failed : DeleteAttempt()
+    }
 
     private fun tryDeleteUri(uri: Uri): DeleteAttempt {
         val resolver = context.contentResolver
@@ -519,19 +531,36 @@ class SyncViewModel(private val context: Context) : ViewModel() {
             if (rows > 0) return DeleteAttempt.Success
         } catch (e: SecurityException) {
             Log.w(TAG, "No permission to delete $uri", e)
-            // MediaStore often requires a user-confirmed bulk delete on API 30+.
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && isMediaStoreUri(uri)) {
-                return DeleteAttempt.NeedsUserConsent
-            }
-            return DeleteAttempt.Failed
         } catch (e: Exception) {
             Log.w(TAG, "ContentResolver delete failed for $uri", e)
         }
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && isMediaStoreUri(uri)) {
-            return DeleteAttempt.NeedsUserConsent
+        // Both direct deletes were denied. On API 30+ the system offers a recoverable,
+        // user-confirmed bulk delete via MediaStore — but createDeleteRequest() only
+        // accepts media:// URIs. Files picked through the SAF folder picker (DCIM/SD-card
+        // sync) carry externalstorage.documents URIs instead, so translate them to their
+        // MediaStore equivalent first; that's what actually lets DCIM/gallery items be
+        // removed instead of always failing.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            if (isMediaStoreUri(uri)) {
+                return DeleteAttempt.NeedsUserConsent(uri)
+            }
+            val mediaUri = resolveMediaStoreUri(uri)
+            if (mediaUri != null) {
+                return DeleteAttempt.NeedsUserConsent(mediaUri)
+            }
         }
         return DeleteAttempt.Failed
+    }
+
+    /** Translate a SAF document URI to its MediaStore URI, if the file is media-indexed. */
+    private fun resolveMediaStoreUri(uri: Uri): Uri? {
+        return try {
+            MediaStore.getMediaUri(context, uri)
+        } catch (e: Exception) {
+            Log.w(TAG, "getMediaUri failed for $uri", e)
+            null
+        }
     }
 
     private fun isMediaStoreUri(uri: Uri): Boolean {
@@ -755,23 +784,127 @@ sealed class UiState {
 fun SyncMainScreen(viewModel: SyncViewModel) {
     val uiState by viewModel.uiState
     val uploadProgress by viewModel.uploadProgress
+    var showAbout by remember { mutableStateOf(false) }
 
-    Box(
+    Column(
         modifier = Modifier
             .fillMaxSize()
             .background(Color(0xFFF5F5F5))
             // Extra safety if the host still draws edge-to-edge.
             .windowInsetsPadding(WindowInsets.safeDrawing)
     ) {
-        when (uiState) {
-            is UiState.Idle -> ConnectScreen(viewModel)
-            is UiState.Connecting -> LoadingScreen("Connecting to server...")
-            is UiState.Ready -> FilePickerScreen(viewModel)
-            is UiState.Syncing -> SyncProgressScreen(uploadProgress)
-            is UiState.Complete -> CompleteScreen(uploadProgress, viewModel)
-            is UiState.ConflictDialog -> ConflictDialogScreen((uiState as UiState.ConflictDialog).fileInfo, viewModel)
-            is UiState.Error -> ErrorScreen((uiState as UiState.Error).message, viewModel)
+        AppHeaderBar(
+            versionName = viewModel.appVersionName,
+            showBack = showAbout,
+            onInfoClick = { showAbout = true },
+            onBackClick = { showAbout = false }
+        )
+
+        Box(modifier = Modifier.fillMaxSize()) {
+            if (showAbout) {
+                AboutScreen()
+            } else {
+                when (uiState) {
+                    is UiState.Idle -> ConnectScreen(viewModel)
+                    is UiState.Connecting -> LoadingScreen("Connecting to server...")
+                    is UiState.Ready -> FilePickerScreen(viewModel)
+                    is UiState.Syncing -> SyncProgressScreen(uploadProgress)
+                    is UiState.Complete -> CompleteScreen(uploadProgress, viewModel)
+                    is UiState.ConflictDialog -> ConflictDialogScreen((uiState as UiState.ConflictDialog).fileInfo, viewModel)
+                    is UiState.Error -> ErrorScreen((uiState as UiState.Error).message, viewModel)
+                }
+            }
         }
+    }
+}
+
+/** Persistent header shown at the top of every screen: app name, version, and About access. */
+@Composable
+fun AppHeaderBar(
+    versionName: String,
+    showBack: Boolean,
+    onInfoClick: () -> Unit,
+    onBackClick: () -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(Color(0xFF673AB7))
+            .padding(horizontal = 8.dp, vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        if (showBack) {
+            IconButton(onClick = onBackClick) {
+                Icon(
+                    imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                    contentDescription = "Back",
+                    tint = Color.White
+                )
+            }
+        }
+        Text(
+            text = "LanSync v$versionName",
+            color = Color.White,
+            fontWeight = FontWeight.Bold,
+            fontSize = 16.sp,
+            modifier = Modifier
+                .weight(1f)
+                .padding(start = if (showBack) 0.dp else 12.dp)
+        )
+        if (!showBack) {
+            IconButton(onClick = onInfoClick) {
+                Icon(
+                    imageVector = Icons.Filled.Info,
+                    contentDescription = "About LanSync",
+                    tint = Color.White
+                )
+            }
+        }
+    }
+}
+
+@Composable
+fun AboutScreen() {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(24.dp)
+    ) {
+        Text(
+            text = "About LanSync",
+            fontSize = 22.sp,
+            fontWeight = FontWeight.Bold
+        )
+        Spacer(modifier = Modifier.height(16.dp))
+        Text(
+            text = "LanSync copies photos, videos, and folders from this device to a " +
+                "computer on the same local network. It connects directly over Wi-Fi to a " +
+                "LanSync server — there is no cloud, and nothing leaves your network.",
+            fontSize = 15.sp
+        )
+        Spacer(modifier = Modifier.height(16.dp))
+        Text(
+            text = "A running server is required",
+            fontSize = 17.sp,
+            fontWeight = FontWeight.Bold
+        )
+        Spacer(modifier = Modifier.height(8.dp))
+        Text(
+            text = "This app cannot sync on its own. Before connecting, the LanSync server " +
+                "must be running on a computer on the same local network as this device " +
+                "(the server listens on port 10101 by default). Start the server, note the " +
+                "computer's IP address, and enter it on the connect screen along with a " +
+                "username and device name.",
+            fontSize = 15.sp
+        )
+        Spacer(modifier = Modifier.height(16.dp))
+        Text(
+            text = "Once connected, pick photos, videos, documents, or an entire folder " +
+                "(such as DCIM or an SD card) to upload. After a successful sync you can " +
+                "optionally remove the synced files from this device to free up space.",
+            fontSize = 15.sp
+        )
     }
 }
 
@@ -869,7 +1002,8 @@ fun ConnectScreen(viewModel: SyncViewModel) {
                     host = host.trim(),
                     port = port.toIntOrNull() ?: SettingsStore.DEFAULT_PORT,
                     username = username.trim(),
-                    deviceName = deviceName.trim()
+                    deviceName = deviceName.trim(),
+                    appVersion = viewModel.appVersionName
                 )
                 viewModel.initializeSync(config)
             },
