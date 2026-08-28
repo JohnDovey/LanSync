@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- LanSync brand purple — matches the in-app header bar (SyncScreen.kt AppHeaderBar). -->
+    <color name="ic_launcher_background">#673AB7</color>
+</resources>
